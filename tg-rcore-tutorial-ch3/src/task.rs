@@ -18,6 +18,9 @@
 use tg_kernel_context::LocalContext;
 use tg_syscall::{Caller, SyscallId};
 
+/// 统计表长度：需覆盖本章练习中的 `sys_trace`（410）等编号。
+const SYSCALL_COUNT_MAX: usize = 512;
+
 /// 任务控制块（Task Control Block, TCB）
 ///
 /// 每个用户程序对应一个 TCB，包含：
@@ -32,6 +35,8 @@ pub struct TaskControlBlock {
     /// 用户栈：8 KiB（1024 个 usize = 1024 × 8 = 8192 字节）
     /// 每个任务拥有独立的栈空间，避免栈溢出影响其他任务
     stack: [usize; 1024],
+    /// 按系统调用号统计调用次数（`sys_trace` 练习）
+    syscall_counts: [usize; SYSCALL_COUNT_MAX],
 }
 
 /// 调度事件
@@ -55,6 +60,7 @@ impl TaskControlBlock {
         ctx: LocalContext::empty(),
         finish: false,
         stack: [0; 1024],
+        syscall_counts: [0; SYSCALL_COUNT_MAX],
     };
 
     /// 初始化一个任务
@@ -64,6 +70,7 @@ impl TaskControlBlock {
     /// - 将栈指针设置为用户栈的栈顶（高地址端）
     pub fn init(&mut self, entry: usize) {
         self.stack.fill(0);
+        self.syscall_counts.fill(0);
         self.finish = false;
         self.ctx = LocalContext::user(entry);
         // 栈从高地址向低地址增长，所以 sp 指向栈顶（数组末尾之后的地址）
@@ -98,6 +105,39 @@ impl TaskControlBlock {
             self.ctx.a(4),
             self.ctx.a(5),
         ];
+
+        // 每个进入内核的系统调用先记入本任务统计表（含 `TRACE`）。
+        // 对 `trace_request == 2` 的查询而言，当前这次 `TRACE` 已计入 `syscall_counts[TRACE]`。
+        let id_idx = id.0;
+        if id_idx < SYSCALL_COUNT_MAX {
+            self.syscall_counts[id_idx] += 1;
+        }
+
+        if id == Id::TRACE {
+            let ret = match args[0] {
+                // `id` 为 `*const u8`，读一字节
+                0 => unsafe { *(args[1] as *const u8) } as isize,
+                // `id` 为 `*mut u8`，写入 `data` 的最低字节
+                1 => {
+                    unsafe { *(args[1] as *mut u8) = args[2] as u8 };
+                    0
+                }
+                // 查询系统调用号 `id` 的累计次数（当前 `TRACE` 已在上面计入）
+                2 => {
+                    let q = args[1];
+                    if q < SYSCALL_COUNT_MAX {
+                        self.syscall_counts[q] as isize
+                    } else {
+                        0
+                    }
+                }
+                _ => -1,
+            };
+            *self.ctx.a_mut(0) = ret as _;
+            self.ctx.move_next();
+            return Event::None;
+        }
+
         match tg_syscall::handle(Caller { entity: 0, flow: 0 }, id, args) {
             Ret::Done(ret) => match id {
                 // exit 系统调用：返回退出事件

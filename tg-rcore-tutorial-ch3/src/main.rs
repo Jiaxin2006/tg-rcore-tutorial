@@ -294,13 +294,8 @@ mod impls {
         }
     }
 
-    /// Trace 系统调用实现（练习题需要完成的部分）
-    ///
-    /// 当前为占位实现，返回 -1 表示未实现。
-    /// 学生需要在练习中实现 trace 功能，支持：
-    /// - 读取用户内存（trace_request=0）
-    /// - 写入用户内存（trace_request=1）
-    /// - 查询系统调用计数（trace_request=2）
+    /// Trace 系统调用（`sys_trace`）在 `task::TaskControlBlock::handle_syscall` 中实现，
+    /// 以便访问每任务的调用计数表；此处不会被内核路径调用。
     impl Trace for SyscallContext {
         #[inline]
         fn trace(
@@ -310,7 +305,6 @@ mod impls {
             _id: usize,
             _data: usize,
         ) -> isize {
-            tg_console::log::info!("trace: not implemented");
             -1
         }
     }
