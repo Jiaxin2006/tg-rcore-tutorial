@@ -5,7 +5,7 @@
 //!
 //! ## 与第二章的区别
 //!
-//! 第二章的批处理系统中，用户上下文直接在 `rust_main` 的局部变量中管理。
+//! 第二章的批处理系统中，用户态上下文直接在 `rust_main` 的局部变量中管理。
 //! 本章将其封装到 `TaskControlBlock` 中，每个任务拥有独立的 TCB，
 //! 包含用户上下文、完成状态和独立的用户栈，支持多任务并发。
 //!
@@ -18,8 +18,87 @@
 use tg_kernel_context::LocalContext;
 use tg_syscall::{Caller, SyscallId};
 
-/// 统计表长度：需覆盖本章练习中的 `sys_trace`（410）等编号。
-const SYSCALL_COUNT_MAX: usize = 512;
+/// 与 `main.rs` 中 `APP_CAPACITY` 一致：内核可同时容纳的用户任务槽位数。
+pub const MAX_APP_TASKS: usize = 32;
+
+#[cfg(feature = "exercise")]
+mod syscall_trace {
+    //! 每任务一张**稀疏表**：只记录实际出现过的系统调用号及其次数，不占 `512×usize` 稠密表。
+    //! 表放在 BSS，不增大 `rust_main` 栈上的 `tcbs` 数组。
+
+    /// 单任务最多记录多少种不同的系统调用号（同一号多次调用只占一条）。
+    const MAX_DISTINCT: usize = 64;
+
+    #[derive(Clone, Copy)]
+    struct Entry {
+        nr: u32,
+        count: u32,
+    }
+
+    #[derive(Clone, Copy)]
+    struct TaskTable {
+        len: u8,
+        entries: [Entry; MAX_DISTINCT],
+    }
+
+    impl TaskTable {
+        const fn empty() -> Self {
+            Self {
+                len: 0,
+                entries: [Entry { nr: 0, count: 0 }; MAX_DISTINCT],
+            }
+        }
+    }
+
+    static mut TABLES: [TaskTable; super::MAX_APP_TASKS] =
+        [TaskTable::empty(); super::MAX_APP_TASKS];
+
+    pub(super) fn clear_row(task: usize) {
+        if task < super::MAX_APP_TASKS {
+            unsafe {
+                TABLES[task].len = 0;
+            }
+        }
+    }
+
+    pub(super) fn bump(task: usize, syscall_id: usize) {
+        if task >= super::MAX_APP_TASKS {
+            return;
+        }
+        let nr = syscall_id as u32;
+        unsafe {
+            let t = &mut TABLES[task];
+            let n = t.len as usize;
+            for i in 0..n {
+                if t.entries[i].nr == nr {
+                    t.entries[i].count = t.entries[i].count.saturating_add(1);
+                    return;
+                }
+            }
+            if n < MAX_DISTINCT {
+                t.entries[n] = Entry { nr, count: 1 };
+                t.len += 1;
+            }
+        }
+    }
+
+    pub(super) fn get(task: usize, syscall_id: usize) -> usize {
+        if task >= super::MAX_APP_TASKS {
+            return 0;
+        }
+        let nr = syscall_id as u32;
+        unsafe {
+            let t = &TABLES[task];
+            let n = t.len as usize;
+            for i in 0..n {
+                if t.entries[i].nr == nr {
+                    return t.entries[i].count as usize;
+                }
+            }
+        }
+        0
+    }
+}
 
 /// 任务控制块（Task Control Block, TCB）
 ///
@@ -35,8 +114,6 @@ pub struct TaskControlBlock {
     /// 用户栈：8 KiB（1024 个 usize = 1024 × 8 = 8192 字节）
     /// 每个任务拥有独立的栈空间，避免栈溢出影响其他任务
     stack: [usize; 1024],
-    /// 按系统调用号统计调用次数（`sys_trace` 练习）
-    syscall_counts: [usize; SYSCALL_COUNT_MAX],
 }
 
 /// 调度事件
@@ -60,7 +137,6 @@ impl TaskControlBlock {
         ctx: LocalContext::empty(),
         finish: false,
         stack: [0; 1024],
-        syscall_counts: [0; SYSCALL_COUNT_MAX],
     };
 
     /// 初始化一个任务
@@ -68,9 +144,11 @@ impl TaskControlBlock {
     /// - 清零用户栈
     /// - 创建用户态上下文，设置入口地址和 `sstatus.SPP = User`
     /// - 将栈指针设置为用户栈的栈顶（高地址端）
-    pub fn init(&mut self, entry: usize) {
+    /// - `task_index`：当前任务在 `tcbs` 中的下标（练习模式下用于 `sys_trace` 统计表）
+    pub fn init(&mut self, entry: usize, task_index: usize) {
         self.stack.fill(0);
-        self.syscall_counts.fill(0);
+        #[cfg(feature = "exercise")]
+        syscall_trace::clear_row(task_index);
         self.finish = false;
         self.ctx = LocalContext::user(entry);
         // 栈从高地址向低地址增长，所以 sp 指向栈顶（数组末尾之后的地址）
@@ -90,7 +168,9 @@ impl TaskControlBlock {
     ///
     /// 从用户上下文中提取系统调用 ID（a7 寄存器）和参数（a0-a5 寄存器），
     /// 分发到对应的处理函数，并将返回值写回 a0 寄存器。
-    pub fn handle_syscall(&mut self) -> SchedulingEvent {
+    ///
+    /// `task_index`：当前任务在 `tcbs` 中的下标（与 `init` 时一致）。
+    pub fn handle_syscall(&mut self, task_index: usize) -> SchedulingEvent {
         use tg_syscall::{SyscallId as Id, SyscallResult as Ret};
         use SchedulingEvent as Event;
 
@@ -106,36 +186,25 @@ impl TaskControlBlock {
             self.ctx.a(5),
         ];
 
-        // 每个进入内核的系统调用先记入本任务统计表（含 `TRACE`）。
-        // 对 `trace_request == 2` 的查询而言，当前这次 `TRACE` 已计入 `syscall_counts[TRACE]`。
-        let id_idx = id.0;
-        if id_idx < SYSCALL_COUNT_MAX {
-            self.syscall_counts[id_idx] += 1;
-        }
+        #[cfg(feature = "exercise")]
+        {
+            let id_idx = id.0;
+            syscall_trace::bump(task_index, id_idx);
 
-        if id == Id::TRACE {
-            let ret = match args[0] {
-                // `id` 为 `*const u8`，读一字节
-                0 => (unsafe { *(args[1] as *const u8) }) as isize,
-                // `id` 为 `*mut u8`，写入 `data` 的最低字节
-                1 => {
-                    unsafe { *(args[1] as *mut u8) = args[2] as u8 };
-                    0
-                }
-                // 查询系统调用号 `id` 的累计次数（当前 `TRACE` 已在上面计入）
-                2 => {
-                    let q = args[1];
-                    if q < SYSCALL_COUNT_MAX {
-                        self.syscall_counts[q] as isize
-                    } else {
+            if id == Id::TRACE {
+                let ret = match args[0] {
+                    0 => (unsafe { *(args[1] as *const u8) }) as isize,
+                    1 => {
+                        unsafe { *(args[1] as *mut u8) = args[2] as u8 };
                         0
                     }
-                }
-                _ => -1,
-            };
-            *self.ctx.a_mut(0) = ret as _;
-            self.ctx.move_next();
-            return Event::None;
+                    2 => syscall_trace::get(task_index, args[1]) as isize,
+                    _ => -1,
+                };
+                *self.ctx.a_mut(0) = ret as _;
+                self.ctx.move_next();
+                return Event::None;
+            }
         }
 
         match tg_syscall::handle(Caller { entity: 0, flow: 0 }, id, args) {

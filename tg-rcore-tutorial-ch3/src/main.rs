@@ -51,8 +51,8 @@ use tg_sbi;
 #[cfg(target_arch = "riscv64")]
 core::arch::global_asm!(include_str!(env!("APP_ASM")));
 
-// 最大支持的应用程序数量
-const APP_CAPACITY: usize = 32;
+// 最大支持的应用程序数量（与 `task::MAX_APP_TASKS` 一致）
+const APP_CAPACITY: usize = task::MAX_APP_TASKS;
 
 // 定义内核入口点：分配 (APP_CAPACITY + 2) * 8 KiB = 272 KiB 的内核栈
 // 比第二章更大，因为需要同时容纳多个任务的内核上下文。
@@ -109,7 +109,7 @@ extern "C" fn rust_main() -> ! {
     for (i, app) in tg_linker::AppMeta::locate().iter().enumerate() {
         let entry = app.as_ptr() as usize;
         log::info!("load app{i} to {entry:#x}");
-        tcbs[i].init(entry);
+        tcbs[i].init(entry, i);
         index_mod += 1;
     }
     println!();
@@ -149,7 +149,7 @@ extern "C" fn rust_main() -> ! {
                     // ─── 系统调用：用户程序执行了 ecall 指令 ───
                     Trap::Exception(Exception::UserEnvCall) => {
                         use task::SchedulingEvent as Event;
-                        match tcb.handle_syscall() {
+                        match tcb.handle_syscall(i) {
                             // 普通系统调用（如 write）：处理完成后继续运行当前任务
                             Event::None => continue,
                             // exit 系统调用：任务主动退出
