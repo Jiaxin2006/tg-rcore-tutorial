@@ -1,3 +1,36 @@
+## 学生提交信息
+
+**crate 名称：** `jiaxin2006-tg-rcore-tutorial-t1l1`
+
+**crate 版本：** `0.0.1-preview.1`
+
+**仓库地址：** `https://github.com/Jiaxin2006/tg-rcore-tutorial`
+
+**本章代码路径（页面）：** `https://github.com/Jiaxin2006/tg-rcore-tutorial/tree/test/tg-rcore-tutorial-ch3`
+
+**建议 tag：** `jiaxin2006-tg-rcore-tutorial-t1l1-v0.0.1-preview.1`
+
+**复现方式：**
+
+1. **通过 crates.io 拉取本章 crate**
+
+   ```bash
+   cargo install cargo-clone   # 若尚未安装
+   cargo clone jiaxin2006-tg-rcore-tutorial-t1l1
+   cd jiaxin2006-tg-rcore-tutorial-t1l1
+   cargo run --features exercise
+   ```
+
+2. **整仓克隆 GitHub 仓库**
+
+   ```bash
+   git clone https://github.com/Jiaxin2006/tg-rcore-tutorial.git
+   cd tg-rcore-tutorial/tg-rcore-tutorial-ch3
+   cargo run --features exercise
+   ```
+
+---
+
 # 第三章：多道程序与分时多任务
 
 本章在第二章"批处理系统"的基础上，实现了一个**多道程序操作系统**（tg-rcore-tutorial-ch3）。它支持多个用户程序同时驻留在内存中并发执行，通过时钟中断实现**抢占式调度**，通过 `yield` 系统调用支持**协作式调度**，并引入了时间管理功能。
