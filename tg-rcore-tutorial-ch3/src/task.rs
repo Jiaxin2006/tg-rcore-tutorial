@@ -146,6 +146,7 @@ impl TaskControlBlock {
     /// - 将栈指针设置为用户栈的栈顶（高地址端）
     /// - `task_index`：当前任务在 `tcbs` 中的下标（练习模式下用于 `sys_trace` 统计表）
     pub fn init(&mut self, entry: usize, task_index: usize) {
+        let _ = task_index;
         self.stack.fill(0);
         #[cfg(feature = "exercise")]
         syscall_trace::clear_row(task_index);
@@ -171,6 +172,7 @@ impl TaskControlBlock {
     ///
     /// `task_index`：当前任务在 `tcbs` 中的下标（与 `init` 时一致）。
     pub fn handle_syscall(&mut self, task_index: usize) -> SchedulingEvent {
+        let _ = task_index;
         use tg_syscall::{SyscallId as Id, SyscallResult as Ret};
         use SchedulingEvent as Event;
 
