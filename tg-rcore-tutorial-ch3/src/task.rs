@@ -95,7 +95,7 @@ impl TaskControlBlock {
         use SchedulingEvent as Event;
 
         // a7 寄存器存放 syscall ID
-        let id = self.ctx.a(7).into();
+        let id: SyscallId = self.ctx.a(7).into();
         // a0-a5 寄存器存放系统调用参数
         let args = [
             self.ctx.a(0),
@@ -116,7 +116,7 @@ impl TaskControlBlock {
         if id == Id::TRACE {
             let ret = match args[0] {
                 // `id` 为 `*const u8`，读一字节
-                0 => unsafe { *(args[1] as *const u8) } as isize,
+                0 => (unsafe { *(args[1] as *const u8) }) as isize,
                 // `id` 为 `*mut u8`，写入 `data` 的最低字节
                 1 => {
                     unsafe { *(args[1] as *mut u8) = args[2] as u8 };
