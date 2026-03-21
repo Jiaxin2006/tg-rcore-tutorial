@@ -181,7 +181,7 @@ extern "C" fn rust_main() -> ! {
     for (i, elf) in tg_linker::AppMeta::locate().iter().enumerate() {
         let base = elf.as_ptr() as usize;
         log::info!("detect app[{i}]: {base:#x}..{:#x}", base + elf.len());
-        if let Some(process) = Process::new(ElfFile::new(elf).unwrap()) {
+        if let Some(process) = Process::new(ElfFile::new(elf).unwrap(), i) {
             // 将内核传送门页表项共享到用户地址空间
             // 这样传送门在两个地址空间的虚拟地址相同
             process.address_space.root()[portal_idx] = ks.root()[portal_idx];
@@ -249,6 +249,12 @@ extern "C" fn schedule() -> ! {
                 let ctx = &mut ctx.context;
                 let id: Id = ctx.a(7).into();
                 let args = [ctx.a(0), ctx.a(1), ctx.a(2), ctx.a(3), ctx.a(4), ctx.a(5)];
+                #[cfg(feature = "exercise")]
+                {
+                    if let Some(p) = unsafe { PROCESSES.get_mut() }.get(0) {
+                        crate::process::syscall_trace::bump(p.task_slot, id.0);
+                    }
+                }
                 match tg_syscall::handle(Caller { entity: 0, flow: 0 }, id, args) {
                     Ret::Done(ret) => match id {
                         // exit：移除进程
@@ -560,7 +566,7 @@ mod impls {
     /// 引入虚存机制后，读写用户内存必须先通过页表翻译并校验权限：
     /// - 读取（request=0）：检查可读 `"U_RV"`
     /// - 写入（request=1）：检查可写 `"U_WV"`（加 `U` 表示用户态可见）
-    /// - 统计（request=2）：ch4 不做计数，返回 0
+    /// - 统计（request=2）：与 ch3 一致，读稀疏表；本次 `TRACE` 已在 `schedule` 里先 `bump`
     impl Trace for SyscallContext {
         fn trace(
             &self,
@@ -597,7 +603,16 @@ mod impls {
                         -1
                     }
                 }
-                2 => 0,
+                2 => {
+                    #[cfg(feature = "exercise")]
+                    {
+                        crate::process::syscall_trace::get(process.task_slot, id) as isize
+                    }
+                    #[cfg(not(feature = "exercise"))]
+                    {
+                        0
+                    }
+                }
                 _ => -1,
             }
         }

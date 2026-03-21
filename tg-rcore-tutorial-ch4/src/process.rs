@@ -33,6 +33,86 @@ use xmas_elf::{
     program, ElfFile,
 };
 
+/// 与加载应用数上界一致；稀疏 syscall 统计表按槽位索引。
+pub const MAX_PROCESS_SLOTS: usize = 32;
+
+#[cfg(feature = "exercise")]
+pub(crate) mod syscall_trace {
+    //! 与 ch3 相同：每槽位一张稀疏表，放在 BSS，避免在每进程结构体里塞 `512×usize` 拖垮 cache。
+
+    const MAX_DISTINCT: usize = 64;
+
+    #[derive(Clone, Copy)]
+    struct Entry {
+        nr: u32,
+        count: u32,
+    }
+
+    #[derive(Clone, Copy)]
+    struct TaskTable {
+        len: u8,
+        entries: [Entry; MAX_DISTINCT],
+    }
+
+    impl TaskTable {
+        const fn empty() -> Self {
+            Self {
+                len: 0,
+                entries: [Entry { nr: 0, count: 0 }; MAX_DISTINCT],
+            }
+        }
+    }
+
+    static mut TABLES: [TaskTable; super::MAX_PROCESS_SLOTS] =
+        [TaskTable::empty(); super::MAX_PROCESS_SLOTS];
+
+    pub(crate) fn clear_row(task: usize) {
+        if task < super::MAX_PROCESS_SLOTS {
+            unsafe {
+                TABLES[task].len = 0;
+            }
+        }
+    }
+
+    pub(crate) fn bump(task: usize, syscall_id: usize) {
+        if task >= super::MAX_PROCESS_SLOTS {
+            return;
+        }
+        let nr = syscall_id as u32;
+        unsafe {
+            let t = &mut TABLES[task];
+            let n = t.len as usize;
+            for i in 0..n {
+                if t.entries[i].nr == nr {
+                    t.entries[i].count = t.entries[i].count.saturating_add(1);
+                    return;
+                }
+            }
+            if n < MAX_DISTINCT {
+                t.entries[n] = Entry { nr, count: 1 };
+                t.len += 1;
+            }
+        }
+    }
+
+    pub(crate) fn get(task: usize, syscall_id: usize) -> usize {
+        if task >= super::MAX_PROCESS_SLOTS {
+            return 0;
+        }
+        let nr = syscall_id as u32;
+        unsafe {
+            let t = &TABLES[task];
+            let n = t.len as usize;
+            for i in 0..n {
+                if t.entries[i].nr == nr {
+                    return t.entries[i].count as usize;
+                }
+            }
+        }
+        0
+    }
+}
+
 /// 进程结构体
 ///
 /// 包含进程运行所需的全部信息：
@@ -49,6 +129,8 @@ pub struct Process {
     pub heap_bottom: usize,
     /// 当前程序 break 位置（堆顶）
     pub program_brk: usize,
+    /// 创建时的应用下标，用于 `exercise` 下稀疏 syscall 统计表行号（与 ch3 `task_index` 同语义）
+    pub task_slot: usize,
 }
 
 impl Process {
@@ -60,7 +142,10 @@ impl Process {
     /// 3. 解析 ELF 的 LOAD 段，映射到地址空间（带权限标志）
     /// 4. 分配用户栈（2 页 = 8 KiB），映射到高地址区域
     /// 5. 创建 ForeignContext，设置入口地址和 satp
-    pub fn new(elf: ElfFile) -> Option<Self> {
+    pub fn new(elf: ElfFile, task_slot: usize) -> Option<Self> {
+        #[cfg(feature = "exercise")]
+        syscall_trace::clear_row(task_slot);
+
         // 验证 ELF 头：必须是 RISC-V 64 位可执行文件
         let entry = match elf.header.pt2 {
             HeaderPt2::Header64(pt2)
@@ -150,6 +235,7 @@ impl Process {
             address_space,
             heap_bottom,
             program_brk: heap_bottom,
+            task_slot,
         })
     }
 
