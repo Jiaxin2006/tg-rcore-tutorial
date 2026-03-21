@@ -162,3 +162,50 @@ git clone https://github.com/Jiaxin2006/tg-rcore-tutorial.git
 cd tg-rcore-tutorial/tg-rcore-tutorial-ch4
 cargo run --features exercise
 流程和 ch3 完全一致，唯一区别是包名从 t1l1 变成了 t1l2、tag 名对应更新。
+
+## ch5
+
+Q:1. 现在能确定 ch4/ch3 已经完成的部分同步到 T1L3 分支了吗？
+2. 我要完成 ch5, 请帮我解释这里都需要做什么，并实现代码
+A: 可以，先直接回答你的两个问题：
+
+ch4/ch3 是否同步到 T1L3
+目前仓库在 T1L3，且 T1L3 与 origin/T1L3 指向同一提交 ff6ab8a（无 ahead/behind）。
+这个提交就是你的 ch4 完成提交，并且历史里包含了 ch3 的提交 7d5ac6a。
+所以就“分支同步”这件事，当前是已同步的。
+ch5 要做什么 + 我已经帮你实现了什么
+ch5 exercise 核心要点是 4 件事：
+
+迁移 mmap / munmap 到新的进程结构（从当前进程地址空间做映射/取消映射）
+实现 spawn（ID 400）：直接从 ELF 创建子进程，不走 fork 地址空间拷贝
+实现 set_priority（ID 140）：优先级必须 >=2
+将调度从 FIFO 改为 stride：每次选 stride 最小者运行，运行后 stride += BigStride / priority
+我已在 ch5 里完成实现：
+
+tg-rcore-tutorial-ch5/src/process.rs
+
+给 Process 增加 stride、priority
+新建进程（from_elf / fork）初始化为 stride=0、priority=16
+tg-rcore-tutorial-ch5/src/processor.rs
+
+调度器从 FIFO 改为 stride 选择最小 stride 的 PID
+每次被选中后更新 stride += pass，pass = BIG_STRIDE / priority（并做了最小值保护）
+tg-rcore-tutorial-ch5/src/main.rs
+
+实现 spawn：从用户传入路径解析 app，创建新进程并挂到当前进程子树
+实现 set_priority：prio < 2 返回 -1，否则设置并返回 prio
+实现 mmap / munmap：页对齐校验、prot 校验、区间冲突/覆盖校验、映射与反映射
+验证结果：
+
+我跑过 TG_SKIP_USER_APPS=1 cargo check --features exercise，ch5 已通过编译。
+直接 cargo check --features exercise 会因你本机缺少 cargo-clone 在 build.rs 阶段失败（这是环境问题，不是这次代码逻辑问题）。
+你下一步可以这样测：
+
+安装：cargo install cargo-clone
+然后在 tg-rcore-tutorial-ch5 下跑：./test.sh exercise
+如果你愿意，我下一步可以继续帮你直接跑 exercise 测例并按失败项逐个修到全绿。
+
+## ch6
+
+Q: 请帮我查看 ch6 的要求并实现代码。查看 @tg-rcore-tutorial/docs/report.md 并吸取之前的bug 的教训
+A: 
