@@ -27,6 +27,9 @@ use alloc::collections::{BTreeMap, VecDeque};
 use core::cell::UnsafeCell;
 use tg_task_manage::{Manage, PManager, ProcId, Schedule};
 
+/// stride 调度的大步长常量
+const BIG_STRIDE: usize = 1 << 20;
+
 /// 处理器全局管理器
 ///
 /// 封装 `PManager<Process, ProcManager>`，通过 `UnsafeCell` 提供内部可变性。
@@ -107,8 +110,32 @@ impl Schedule<ProcId> for ProcManager {
         self.ready_queue.push_back(id);
     }
 
-    /// 从就绪队列头部取出下一个要执行的进程
+    /// 从就绪队列中挑选 stride 最小的进程运行
     fn fetch(&mut self) -> Option<ProcId> {
-        self.ready_queue.pop_front()
+        while !self.ready_queue.is_empty() {
+            let mut best_idx = 0usize;
+            let mut best_stride = usize::MAX;
+            let mut best_pid = ProcId::from_usize(usize::MAX);
+
+            for (idx, pid) in self.ready_queue.iter().enumerate() {
+                if let Some(proc) = self.tasks.get(pid) {
+                    if proc.stride < best_stride
+                        || (proc.stride == best_stride && pid.get_usize() < best_pid.get_usize())
+                    {
+                        best_idx = idx;
+                        best_stride = proc.stride;
+                        best_pid = *pid;
+                    }
+                }
+            }
+
+            let pid = self.ready_queue.remove(best_idx)?;
+            if let Some(proc) = self.tasks.get_mut(&pid) {
+                let pass = (BIG_STRIDE / proc.priority.max(2)).max(1);
+                proc.stride = proc.stride.wrapping_add(pass);
+                return Some(pid);
+            }
+        }
+        None
     }
 }
