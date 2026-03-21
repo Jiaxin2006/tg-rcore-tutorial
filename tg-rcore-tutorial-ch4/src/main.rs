@@ -580,7 +580,7 @@ mod impls {
                         .address_space
                         .translate::<u8>(VAddr::new(id), READABLE)
                     {
-                        unsafe { *ptr.as_ptr() } as isize
+                        (unsafe { *ptr.as_ptr() }) as isize
                     } else {
                         -1
                     }
