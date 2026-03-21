@@ -1,15 +1,15 @@
 [package]
-name = "tg-rcore-tutorial-ch4"
-description = "Chapter 4 of rCore Tutorial: Address space management with SV39 virtual memory."
-version = "0.4.8"
+name = "jiaxin2006-tg-rcore-tutorial-t1l2"
+description = "Student AI4OSE lab crate for Chapter 4 of rCore Tutorial: address space management with SV39 virtual memory."
+version = "0.0.1-preview.1"
 edition = "2024"
-authors = ["YdrMaster <ydrml@hotmail.com>","Yifan Wang<w-yf22@mails.tsinghua.edu.cn>","Yu Chen <yuchen@tsinghua.edu.cn>"]
-repository = "https://github.com/rcore-os/tg-rcore-tutorial-ch4"
-homepage = "https://github.com/rcore-os/tg-rcore-tutorial-ch4/tree/test"
-documentation = "https://docs.rs/tg-rcore-tutorial-ch4"
+authors = ["Jiaxin Han <hanjx23@mails.tsinghua.edu.cn>"]
+repository = "https://github.com/Jiaxin2006/tg-rcore-tutorial"
+homepage = "https://github.com/Jiaxin2006/tg-rcore-tutorial/tree/test/tg-rcore-tutorial-ch4"
+documentation = "https://docs.rs/jiaxin2006-tg-rcore-tutorial-t1l2"
 license = "GPL-3.0"
 readme = "README.md"
-keywords = ["rcore", "tutorial", "no-std", "riscv", "virtual-memory"]
+keywords = ["ai", "ai4ose", "kernel", "learning", "os"]
 categories = ["no-std", "embedded"]
 exclude = [
     "tg-user/**",
@@ -18,6 +18,10 @@ exclude = [
 
 [features]
 exercise = []
+
+[[bin]]
+name = "jiaxin2006-tg-rcore-tutorial-t1l2"
+path = "src/main.rs"
 
 [profile.dev]
 panic = "abort"

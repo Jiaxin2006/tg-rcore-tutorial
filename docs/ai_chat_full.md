@@ -86,3 +86,79 @@ cd tg-rcore-tutorial/tg-rcore-tutorial-ch4
 cargo run                        # 基础测试
 cargo run --features exercise    # 练习测试
 ./test.sh exercise               # 自动化检查
+
+Q: 请直接从 ch3 merge syscall count
+A: 已按 ch3 的做法改完：syscall 统计不再挂在每个 Process 的大数组上，而是用 BSS 里的稀疏表（与 ch3 task.rs 里 syscall_trace 同结构），并只在 --features exercise 下编译与更新。
+
+改动摘要
+process.rs
+
+增加 #[cfg(feature = "exercise")] pub(crate) mod syscall_trace：clear_row / bump / get，TABLES: [TaskTable; MAX_PROCESS_SLOTS]（32 槽，每槽最多 64 种不同 syscall 号）。
+Process 增加 task_slot: usize（创建时用应用枚举下标 i，与 ch3 的 task_index 一致）。
+Process::new(elf, task_slot)：在 exercise 下对新槽 clear_row(task_slot)。
+main.rs
+
+Process::new(..., i) 传入枚举下标 i。
+在 schedule 里、tg_syscall::handle 之前（仅 exercise）：syscall_trace::bump(当前进程.task_slot, id.0)。
+trace request=2（仅 exercise）：syscall_trace::get(process.task_slot, id)；非 exercise 仍为 0。
+这样 不会在每进程结构里塞 512×usize，工作集小得多，行为与 ch3 的统计语义一致（含「本次 TRACE 先计入再查询」）。
+
+请在本机验证：
+
+cd tg-rcore-tutorial-ch4
+cargo run --features exercise
+
+Q: 请帮我总结一下和 ch3 一样（T1L1 分支）打包上传 crate 的步骤
+A: 完整步骤
+第一步：改 Cargo.toml
+和 ch3 一样，只改 [package] 元信息 + keywords + 加 [[bin]]；不用动 path 依赖（发布时 Cargo 自动忽略 path，只用 version）。
+
+Cargo.toml
++12
+-8
+[package]name = "tg-rcore-tutorial-ch4"description = "Chapter 4 of rCore Tutorial: Address space management with SV39 virtual memory."version = "0.4.8"
+name = "tg-rcore-tutorial-ch4"description = "Chapter 4 of rCore Tutorial: Address space management with SV39 virtual memory."version = "0.4.8"[package]name = "jiaxin2006-tg-rcore-tutorial-t1l2"
+第二步到第六步（在虚拟机上执行）
+按顺序执行：
+
+# ── 1. 确认测试通过 ──
+cd /home/parallels/Desktop/OS/tg-rcore-tutorial/tg-rcore-tutorial-ch4
+cargo run                        # 基础测试
+cargo run --features exercise    # 练习测试
+# ── 2. 打包验证 ──
+cargo package --list             # 看包含哪些文件
+cargo package                    # 生成 .crate 并本地验证编译
+cargo publish --dry-run          # 模拟上传
+# ── 3. 正式发布 ──
+cargo login                      # 若本次会话尚未登录
+cargo publish
+# ── 4. 提交 + 打 tag ──
+cd /home/parallels/Desktop/OS/tg-rcore-tutorial
+git add -A
+git commit -m "ch4: implement trace/mmap/munmap exercises, prepare crate for publishing"
+git tag jiaxin2006-tg-rcore-tutorial-t1l2-v0.0.1-preview.1
+git push origin T1L2
+git push origin jiaxin2006-tg-rcore-tutorial-t1l2-v0.0.1-preview.1
+# ── 5. 合并到 test ──
+git checkout test
+git pull origin test
+git merge T1L2
+git push origin test
+# ── 6.（可选）建下一章工作分支 ──
+git checkout test
+git checkout -b T1L3
+git push -u origin T1L3
+课程表格填写
+3.21: jiaxin2006-tg-rcore-tutorial-t1l2
+（日期改成你实际发布的那天。）
+
+复现方式（助教可用）
+# 方式一：crates.io
+cargo clone jiaxin2006-tg-rcore-tutorial-t1l2
+cd jiaxin2006-tg-rcore-tutorial-t1l2
+cargo run --features exercise
+# 方式二：GitHub
+git clone https://github.com/Jiaxin2006/tg-rcore-tutorial.git
+cd tg-rcore-tutorial/tg-rcore-tutorial-ch4
+cargo run --features exercise
+流程和 ch3 完全一致，唯一区别是包名从 t1l1 变成了 t1l2、tag 名对应更新。
