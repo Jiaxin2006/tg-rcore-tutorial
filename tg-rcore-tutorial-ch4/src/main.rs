@@ -356,7 +356,7 @@ fn kernel_space(
 /// 与前几章不同，本章的系统调用实现需要进行**地址翻译**：
 /// 用户传入的指针是虚拟地址，内核需要通过页表将其翻译为物理地址才能访问。
 mod impls {
-    use crate::{build_flags, Sv39, PROCESSES};
+    use crate::{build_flags, parse_flags, Sv39, PROCESSES};
     use alloc::alloc::alloc_zeroed;
     use core::{alloc::Layout, ptr::NonNull};
     use tg_console::log;
@@ -555,34 +555,62 @@ mod impls {
         }
     }
 
-    /// Trace 系统调用实现（练习题需要完成的部分）
+    /// Trace 系统调用实现
     ///
-    /// 引入虚存机制后，原来的 trace 实现无效了，需要：
-    /// - 读取时检查用户地址是否可见且可读
-    /// - 写入时检查用户地址是否可见且可写
-    /// - 使用 translate() 方法进行地址翻译和权限检查
+    /// 引入虚存机制后，读写用户内存必须先通过页表翻译并校验权限：
+    /// - 读取（request=0）：检查可读 `"U_RV"`
+    /// - 写入（request=1）：检查可写 `"U_WV"`（加 `U` 表示用户态可见）
+    /// - 统计（request=2）：ch4 不做计数，返回 0
     impl Trace for SyscallContext {
-        #[inline]
         fn trace(
             &self,
-            _caller: Caller,
-            _trace_request: usize,
-            _id: usize,
-            _data: usize,
+            caller: Caller,
+            trace_request: usize,
+            id: usize,
+            data: usize,
         ) -> isize {
-            tg_console::log::info!("trace: not implemented");
-            -1
+            let process = match unsafe { PROCESSES.get_mut() }.get_mut(caller.entity) {
+                Some(p) => p,
+                None => return -1,
+            };
+            match trace_request {
+                0 => {
+                    const READABLE: VmFlags<Sv39> = build_flags("U_RV");
+                    if let Some(ptr) = process
+                        .address_space
+                        .translate::<u8>(VAddr::new(id), READABLE)
+                    {
+                        unsafe { *ptr.as_ptr() } as isize
+                    } else {
+                        -1
+                    }
+                }
+                1 => {
+                    const WRITABLE: VmFlags<Sv39> = build_flags("U_WV");
+                    if let Some(ptr) = process
+                        .address_space
+                        .translate::<u8>(VAddr::new(id), WRITABLE)
+                    {
+                        unsafe { *ptr.as_ptr() = data as u8 };
+                        0
+                    } else {
+                        -1
+                    }
+                }
+                2 => 0,
+                _ => -1,
+            }
         }
     }
 
-    /// Memory 系统调用实现（练习题需要完成的部分）
+    /// Memory 系统调用实现
     ///
-    /// - `mmap`：将物理内存映射到用户虚拟地址空间
+    /// - `mmap`：分配物理页并映射到用户虚拟地址空间
     /// - `munmap`：取消虚拟内存映射
     impl Memory for SyscallContext {
         fn mmap(
             &self,
-            _caller: Caller,
+            caller: Caller,
             addr: usize,
             len: usize,
             prot: i32,
@@ -590,15 +618,98 @@ mod impls {
             _fd: i32,
             _offset: usize,
         ) -> isize {
-            tg_console::log::info!(
-                "mmap: addr = {addr:#x}, len = {len}, prot = {prot}, not implemented"
-            );
-            -1
+            use tg_kernel_vm::page_table::MmuMeta;
+            const PAGE_SIZE: usize = 1 << Sv39::PAGE_BITS;
+
+            if addr % PAGE_SIZE != 0 {
+                return -1;
+            }
+            let prot = prot as usize;
+            if prot & !0x7 != 0 || prot & 0x7 == 0 {
+                return -1;
+            }
+
+            let pages = (len + PAGE_SIZE - 1) / PAGE_SIZE;
+            if pages == 0 {
+                return 0;
+            }
+
+            let process = match unsafe { PROCESSES.get_mut() }.get_mut(caller.entity) {
+                Some(p) => p,
+                None => return -1,
+            };
+            
+            // VPN = 字节地址 / 页大小，包装成 sv39 的 VPN 类型
+            let start_vpn = VPN::<Sv39>::new(addr >> Sv39::PAGE_BITS);
+            let end_vpn = start_vpn + pages;
+
+            // prot: bit0=R, bit1=W, bit2=X  →  RISC-V PTE: bit1=R, bit2=W, bit3=X
+            let mut flag_str: [u8; 5] = *b"U___V";
+            if prot & 1 != 0 {
+                flag_str[3] = b'R';
+            }
+            if prot & 2 != 0 {
+                flag_str[2] = b'W';
+            }
+            if prot & 4 != 0 {
+                flag_str[1] = b'X';
+            }
+            // unsafe：责任在调用方；from_utf8_unchecked：保证字符串是有效的utf-8编码; .unwrap()：认为格式永远合法，如果解析失败，则panic
+            let flags =
+                parse_flags(unsafe { core::str::from_utf8_unchecked(&flag_str) }).unwrap();
+
+            // 检查范围内没有已映射的页
+            for area in process.address_space.areas.iter() {
+                if area.start < end_vpn && area.end > start_vpn {
+                    return -1;
+                }
+            }
+
+            process
+                .address_space
+                .map(start_vpn..end_vpn, &[], 0, flags);
+            0
         }
 
-        fn munmap(&self, _caller: Caller, addr: usize, len: usize) -> isize {
-            tg_console::log::info!("munmap: addr = {addr:#x}, len = {len}, not implemented");
-            -1
+        fn munmap(&self, caller: Caller, addr: usize, len: usize) -> isize {
+            use tg_kernel_vm::page_table::MmuMeta;
+            const PAGE_SIZE: usize = 1 << Sv39::PAGE_BITS;
+
+            if addr % PAGE_SIZE != 0 {
+                return -1;
+            }
+
+            let pages = (len + PAGE_SIZE - 1) / PAGE_SIZE;
+            if pages == 0 {
+                return 0;
+            }
+
+            let process = match unsafe { PROCESSES.get_mut() }.get_mut(caller.entity) {
+                Some(p) => p,
+                None => return -1,
+            };
+
+            let start_vpn = VPN::<Sv39>::new(addr >> Sv39::PAGE_BITS);
+            let end_vpn = start_vpn + pages;
+
+            // 检查范围内所有页都已映射
+            let mut vpn = start_vpn;
+            while vpn < end_vpn {
+                let mut found = false;
+                for area in process.address_space.areas.iter() {
+                    if vpn >= area.start && vpn < area.end {
+                        found = true;
+                        break;
+                    }
+                }
+                if !found {
+                    return -1;
+                }
+                vpn = vpn + 1;
+            }
+
+            process.address_space.unmap(start_vpn..end_vpn);
+            0
         }
     }
 }
