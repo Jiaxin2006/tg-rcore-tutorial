@@ -83,13 +83,13 @@ impl FSManager for FileSystem {
     }
 
     /// 创建硬链接（TODO 练习题）
-    fn link(&self, _src: &str, _dst: &str) -> isize {
-        unimplemented!()
+    fn link(&self, src: &str, dst: &str) -> isize {
+        self.root.link(src, dst)
     }
 
     /// 删除硬链接（TODO 练习题）
-    fn unlink(&self, _path: &str) -> isize {
-        unimplemented!()
+    fn unlink(&self, path: &str) -> isize {
+        self.root.unlink(path)
     }
 }
 
