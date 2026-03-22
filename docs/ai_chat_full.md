@@ -208,4 +208,55 @@ tg-rcore-tutorial-ch5/src/main.rs
 ## ch6
 
 Q: 请帮我查看 ch6 的要求并实现代码。查看 @tg-rcore-tutorial/docs/report.md 并吸取之前的bug 的教训
-A: 
+A: 我先按你的要求做两步：先读 docs/report.md 提炼“之前踩坑要避免什么”，再完整扫描 ch6 的 exercise.md 和代码里的 TODO，然后直接实现并编译验证。
+
+我已经定位到关键点：ch6 不只是三个文件系统 syscall，还要补上 ch5 遗留 TODO（spawn/priority/mmap/munmap/stride），否则 ch6_usertest 里的前向兼容测例会挂。
+我先从 easy-fs 底层补齐硬链接元数据（nlink）和 inode 回收，再接 syscall 层。
+
+layout.rs
++6
+    pub size: u32,    pub direct: [u32; INODE_DIRECT_COUNT],        self.size = 0;
+    pub size: u32,    pub nlink: u32,    pub direct: [u32; INODE_DIRECT_COUNT],        self.size = 0;        self.nlink = 1;
+efs.rs
++5
+    }
+    }    /// Deallocate an inode    pub fn dealloc_inode(&mut self, inode_id: u32) {        self.inode_bitmap            .dealloc(&self.block_device, inode_id as usize);
+vfs.rs
++118
+pub struct Inode {    block_id: usize,    pub fn new(
+pub struct Inode {    inode_id: u32,    block_id: usize,    pub fn new(        inode_id: u32,
+efs.rs
++1
+-1
+        // release efs lock        Inode::new(block_id, block_offset, Arc::clone(efs), block_device)    }
+        Inode::new(block_id, block_offset, Arc::clone(efs), block_device)        // release efs lock        Inode::new(0, block_id, block_offset, Arc::clone(efs), block_device)    }
+fs.rs
++4
+-4
+    /// 创建硬链接（TODO 练习题）    fn link(&self, _src: &str, _dst: &str) -> isize {        unimplemented!()
+    fn link(&self, _src: &str, _dst: &str) -> isize {        unimplemented!()    /// 创建硬链接（TODO 练习题）    fn link(&self, src: &str, dst: &str) -> isize {        self.root.link(src, dst)
+process.rs
++8
+    pub program_brk: usize,
+    pub program_brk: usize,    /// stride 调度算法中的当前步长    pub stride: usize,    /// 进程优先级（>= 2）    pub priority: usize,
+processor.rs
++29
+-2
+/// 处理器全局管理器
+/// stride 调度的大步长常量const BIG_STRIDE: usize = 1 << 20;/// 处理器全局管理器
+我正在改 ch6/src/main.rs 的 syscall 实现，会特别按你 report.md 的经验避开两类坑：
+
+显式类型标注（避免 SyscallId/返回值推断歧义）
+unsafe 指针运算全部加清晰括号和局部变量（避免你提到的括号 bug）。
+main.rs
++79
+-29
+    use crate::{        build_flags,        fs::{read_all, FS},
+        build_flags,    use crate::{        build_flags, parse_flags,        fs::{read_all, FS},
+main.rs
++105
+-24
+        /// spawn 系统调用（TODO 练习题）        fn spawn(&self, _caller: Caller, _path: usize, _count: usize) -> isize {            let current = PROCESSOR.get_mut().current().unwrap();            tg_console::log::info!(
+        /// spawn 系统调用（TODO 练习题）        fn spawn(&self, _caller: Caller, _path: usize, _count: usize) -> isize {            let current = PROCESSOR.get_mut().current().unwrap();            tg_console::log::info!(                "spawn: parent pid = {}, not implemented",                current.pid.get_usize()            );            -1        }
+代码改动已经到位，我现在开始跑 ch6 编译检查；如果有 borrow/type 错误会继续就地修完再给你结果。
+
