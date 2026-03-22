@@ -296,3 +296,59 @@ TG_SKIP_USER_APPS=1 cargo check --features exercise（ch8）
 当前只有其他 crate 里的 Rust 2024 unsafe_op_in_unsafe_fn 警告，不是这次改动引入的错误。
 
 如果你要，我下一步可以直接帮你跑 ch8 练习测例（cargo run --features exercise + ..._usertest / ./test.sh exercise），再把失败点继续修到全通过。
+
+Q: 告诉我怎么打包sync再publish，并直接修改 sync 中的作者信息
+A: 可以，就是一句话：先把你改过 API 的 sync 单独发成新包，再让 ch8 依赖这个新包，最后再发 ch8。
+
+1) 先改 sync 包名和版本
+编辑 tg-rcore-tutorial-sync/Cargo.toml：
+
+name 改成你自己的新名（避免和官方冲突），例如
+jiaxin2006-tg-rcore-tutorial-sync-t1l5
+version 改成你要发的版本，例如
+0.0.1-preview.1
+authors/repository/homepage/documentation 建议同步改成你的信息
+2) 改 ch8 对 sync 的依赖
+编辑 tg-rcore-tutorial-ch8/Cargo.toml：
+
+把这一行
+
+tg-sync = { package = "tg-rcore-tutorial-sync", ..., version = "0.4.8" }
+改成
+
+tg-sync = { package = "jiaxin2006-tg-rcore-tutorial-sync-t1l5", path = "../tg-rcore-tutorial-sync", version = "0.0.1-preview.1" }
+3) 发布前必须做：提交 git 改动
+你之前报错已经说明了：Cargo.toml 未提交会导致 cargo publish 直接失败。
+所以先 git add + git commit。
+
+4) 发布顺序（严格按这个来）
+先发 sync：
+
+cd "/Users/hanjiaxin/Desktop/操作系统/tg-rcore-tutorial/tg-rcore-tutorial-sync"
+cargo publish --dry-run
+cargo publish
+再发 ch8：
+
+cd "/Users/hanjiaxin/Desktop/操作系统/tg-rcore-tutorial/tg-rcore-tutorial-ch8"
+cargo publish --dry-run --features exercise
+cargo publish --features exercise
+5) 推荐完整命令模板（从仓库根目录）
+cd "/Users/hanjiaxin/Desktop/操作系统/tg-rcore-tutorial"
+# 先提交（按你实际修改文件调整）
+git add tg-rcore-tutorial-sync/Cargo.toml \
+        tg-rcore-tutorial-sync/src/mutex.rs \
+        tg-rcore-tutorial-sync/src/semaphore.rs \
+        tg-rcore-tutorial-ch8/Cargo.toml \
+        tg-rcore-tutorial-ch8/src/main.rs \
+        tg-rcore-tutorial-ch8/src/process.rs
+git commit -m "ch8: publish custom sync crate and wire deadlock detection deps"
+# publish sync
+cd tg-rcore-tutorial-sync
+cargo publish --dry-run
+cargo publish
+# publish ch8
+cd ../tg-rcore-tutorial-ch8
+cargo publish --dry-run --features exercise
+cargo publish --features exercise
+
+
