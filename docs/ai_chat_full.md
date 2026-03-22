@@ -260,3 +260,39 @@ main.rs
         /// spawn 系统调用（TODO 练习题）        fn spawn(&self, _caller: Caller, _path: usize, _count: usize) -> isize {            let current = PROCESSOR.get_mut().current().unwrap();            tg_console::log::info!(                "spawn: parent pid = {}, not implemented",                current.pid.get_usize()            );            -1        }
 代码改动已经到位，我现在开始跑 ch6 编译检查；如果有 borrow/type 错误会继续就地修完再给你结果。
 
+## ch8
+Q: 请帮我看 ch8 主要是做什么的，并完成代码
+A: ch8 的核心目标是把“进程=执行单元”拆成“进程(资源) + 线程(执行)”，并加入同步原语与阻塞调度。你这次练习重点是 死锁检测：
+
+进程内支持线程并发，线程共享 fd_table、地址空间、同步对象
+新增同步 syscall：mutex/semaphore/condvar
+当 mutex_lock / semaphore_down 资源不足时会阻塞线程
+练习要求新增 enable_deadlock_detect(469)，可开关死锁检测
+开启后，若检测到可能死锁，mutex_lock / semaphore_down 需返回 -0xDEAD
+我已经把这部分代码补完并通过编译检查。
+
+我完成的实现
+在 tg-rcore-tutorial-ch8/src/process.rs 增加了进程级开关：
+deadlock_detect_enabled: bool
+from_elf 默认关闭，fork 继承父进程开关状态
+在 tg-rcore-tutorial-ch8/src/main.rs 实现：
+enable_deadlock_detect：参数只接受 0/1，非法返回 -1
+mutex_lock / semaphore_down：在“会阻塞”前进行安全性检测，若不安全返回 -0xDEAD
+基于 Available / Allocation / Need 的安全性判断函数（银行家风格）
+为了让内核能拿到检测所需状态，我扩展了 tg-sync：
+tg-rcore-tutorial-sync/src/mutex.rs
+Mutex trait 增加 holder()、waiting() 快照接口
+MutexBlocking 记录当前持锁线程
+tg-rcore-tutorial-sync/src/semaphore.rs
+记录按线程分配的资源计数
+up 现在接收当前 tid，并维护分配统计
+暴露 deadlock_snapshot() 给检测逻辑使用
+修正了 tg-rcore-tutorial-ch8/Cargo.toml 的 easy-fs 包名/version，使其和你当前本地 easy-fs 一致（preview.1）
+验证结果
+已执行：
+
+TG_SKIP_USER_APPS=1 cargo check --features exercise（ch8）
+结果：通过。
+当前只有其他 crate 里的 Rust 2024 unsafe_op_in_unsafe_fn 警告，不是这次改动引入的错误。
+
+如果你要，我下一步可以直接帮你跑 ch8 练习测例（cargo run --features exercise + ..._usertest / ./test.sh exercise），再把失败点继续修到全通过。

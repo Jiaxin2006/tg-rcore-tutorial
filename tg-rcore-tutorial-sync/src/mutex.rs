@@ -8,6 +8,10 @@ pub trait Mutex: Sync + Send {
     fn lock(&self, tid: ThreadId) -> bool;
     /// 当前线程释放锁，并唤醒某个阻塞在这个锁上的线程
     fn unlock(&self) -> Option<ThreadId>;
+    /// 当前持有锁的线程
+    fn holder(&self) -> Option<ThreadId>;
+    /// 当前等待该锁的线程队列快照
+    fn waiting(&self) -> alloc::vec::Vec<ThreadId>;
 }
 
 /// MutexBlocking
@@ -18,6 +22,7 @@ pub struct MutexBlocking {
 /// MutexBlockingInner
 pub struct MutexBlockingInner {
     locked: bool,
+    holder: Option<ThreadId>,
     wait_queue: VecDeque<ThreadId>,
 }
 
@@ -29,6 +34,7 @@ impl MutexBlocking {
             inner: unsafe {
                 UPIntrFreeCell::new(MutexBlockingInner {
                     locked: false,
+                    holder: None,
                     wait_queue: VecDeque::new(),
                 })
             },
@@ -48,6 +54,7 @@ impl Mutex for MutexBlocking {
         } else {
             // 锁空闲：直接占有。
             mutex_inner.locked = true;
+            mutex_inner.holder = Some(tid);
             true
         }
     }
@@ -57,10 +64,20 @@ impl Mutex for MutexBlocking {
         assert!(mutex_inner.locked);
         if let Some(waking_task) = mutex_inner.wait_queue.pop_front() {
             // 注意：这里不清 locked，语义是“把锁转交给被唤醒线程”。
+            mutex_inner.holder = Some(waking_task);
             Some(waking_task)
         } else {
             mutex_inner.locked = false;
+            mutex_inner.holder = None;
             None
         }
+    }
+
+    fn holder(&self) -> Option<ThreadId> {
+        self.inner.exclusive_access().holder
+    }
+
+    fn waiting(&self) -> alloc::vec::Vec<ThreadId> {
+        self.inner.exclusive_access().wait_queue.iter().copied().collect()
     }
 }

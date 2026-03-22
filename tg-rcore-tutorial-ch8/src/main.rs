@@ -352,6 +352,7 @@ mod impls {
         processor::ProcessorInner,
         Sv39, Thread, PROCESSOR,
     };
+    use alloc::collections::BTreeMap;
     use alloc::sync::Arc;
     use alloc::{alloc::alloc_zeroed, string::String, vec::Vec};
     use core::{alloc::Layout, ptr::NonNull};
@@ -429,6 +430,164 @@ mod impls {
     pub struct SyscallContext;
     const READABLE: VmFlags<Sv39> = build_flags("RV");
     const WRITEABLE: VmFlags<Sv39> = build_flags("W_V");
+    const DEADLOCK_RET: isize = -0xDEAD;
+
+    fn is_unsafe_state(available: &[usize], allocation: &[Vec<usize>], need: &[Vec<usize>]) -> bool {
+        let n = allocation.len();
+        let m = available.len();
+        let mut work = available.to_vec();
+        let mut finish = vec![false; n];
+        loop {
+            let mut progress = false;
+            for i in 0..n {
+                if finish[i] {
+                    continue;
+                }
+                let can_finish = (0..m).all(|j| need[i][j] <= work[j]);
+                if can_finish {
+                    for (j, w) in work.iter_mut().enumerate().take(m) {
+                        *w += allocation[i][j];
+                    }
+                    finish[i] = true;
+                    progress = true;
+                }
+            }
+            if !progress {
+                break;
+            }
+        }
+        finish.iter().any(|ok| !ok)
+    }
+
+    fn detect_mutex_deadlock(
+        processor: *mut ProcessorInner,
+        pid: ProcId,
+        request_tid: ThreadId,
+        request_mutex_id: usize,
+    ) -> bool {
+        let tids = unsafe { (*processor).get_thread(pid).map(|v| v.clone()).unwrap_or_default() };
+        if tids.is_empty() {
+            return false;
+        }
+        let mut tid_to_idx = BTreeMap::new();
+        for (idx, tid) in tids.iter().enumerate() {
+            tid_to_idx.insert(*tid, idx);
+        }
+
+        let mutex_ids = {
+            let proc = unsafe { (*processor).get_proc(pid).unwrap() };
+            proc.mutex_list
+                .iter()
+                .enumerate()
+                .filter_map(|(id, item)| item.as_ref().map(|_| id))
+                .collect::<Vec<usize>>()
+        };
+        let m = mutex_ids.len();
+        if m == 0 {
+            return false;
+        }
+        let req_col = match mutex_ids.iter().position(|id| *id == request_mutex_id) {
+            Some(v) => v,
+            None => return false,
+        };
+        let n = tids.len();
+        let mut available = vec![0usize; m];
+        let mut allocation = vec![vec![0usize; m]; n];
+        let mut need = vec![vec![0usize; m]; n];
+
+        {
+            let proc = unsafe { (*processor).get_proc(pid).unwrap() };
+            for (col, mutex_id) in mutex_ids.iter().enumerate() {
+                let mutex = match proc.mutex_list[*mutex_id].as_ref() {
+                    Some(mutex) => Arc::clone(mutex),
+                    None => continue,
+                };
+                if let Some(holder) = mutex.holder() {
+                    if let Some(&row) = tid_to_idx.get(&holder) {
+                        allocation[row][col] = 1;
+                    }
+                } else {
+                    available[col] = 1;
+                }
+                for waiter in mutex.waiting() {
+                    if let Some(&row) = tid_to_idx.get(&waiter) {
+                        need[row][col] = 1;
+                    }
+                }
+            }
+        }
+
+        if let Some(&row) = tid_to_idx.get(&request_tid) {
+            need[row][req_col] += 1;
+        }
+
+        is_unsafe_state(&available, &allocation, &need)
+    }
+
+    fn detect_semaphore_deadlock(
+        processor: *mut ProcessorInner,
+        pid: ProcId,
+        request_tid: ThreadId,
+        request_sem_id: usize,
+    ) -> bool {
+        let tids = unsafe { (*processor).get_thread(pid).map(|v| v.clone()).unwrap_or_default() };
+        if tids.is_empty() {
+            return false;
+        }
+        let mut tid_to_idx = BTreeMap::new();
+        for (idx, tid) in tids.iter().enumerate() {
+            tid_to_idx.insert(*tid, idx);
+        }
+
+        let sem_ids = {
+            let proc = unsafe { (*processor).get_proc(pid).unwrap() };
+            proc.semaphore_list
+                .iter()
+                .enumerate()
+                .filter_map(|(id, item)| item.as_ref().map(|_| id))
+                .collect::<Vec<usize>>()
+        };
+        let m = sem_ids.len();
+        if m == 0 {
+            return false;
+        }
+        let req_col = match sem_ids.iter().position(|id| *id == request_sem_id) {
+            Some(v) => v,
+            None => return false,
+        };
+        let n = tids.len();
+        let mut available = vec![0usize; m];
+        let mut allocation = vec![vec![0usize; m]; n];
+        let mut need = vec![vec![0usize; m]; n];
+
+        {
+            let proc = unsafe { (*processor).get_proc(pid).unwrap() };
+            for (col, sem_id) in sem_ids.iter().enumerate() {
+                let sem = match proc.semaphore_list[*sem_id].as_ref() {
+                    Some(sem) => Arc::clone(sem),
+                    None => continue,
+                };
+                let (avail, wait_queue, alloc_map) = sem.deadlock_snapshot();
+                available[col] = avail;
+                for (tid, cnt) in &alloc_map {
+                    if let Some(&row) = tid_to_idx.get(tid) {
+                        allocation[row][col] = *cnt;
+                    }
+                }
+                for waiter in wait_queue {
+                    if let Some(&row) = tid_to_idx.get(&waiter) {
+                        need[row][col] += 1;
+                    }
+                }
+            }
+        }
+
+        if let Some(&row) = tid_to_idx.get(&request_tid) {
+            need[row][req_col] += 1;
+        }
+
+        is_unsafe_state(&available, &allocation, &need)
+    }
 
     /// IO 系统调用（与第七章基本相同）
     ///
@@ -735,10 +894,12 @@ mod impls {
         /// V 操作：释放信号量，唤醒等待线程
         fn semaphore_up(&self, _caller: Caller, sem_id: usize) -> isize {
             let processor: *mut ProcessorInner = PROCESSOR.get_mut() as *mut ProcessorInner;
+            let current = unsafe { (*processor).current().unwrap() };
+            let tid = current.tid;
             let current_proc = unsafe { (*processor).get_current_proc().unwrap() };
             let sem = Arc::clone(current_proc.semaphore_list[sem_id].as_ref().unwrap());
-            if let Some(tid) = sem.up() {
-                unsafe { (*processor).re_enque(tid); }
+            if let Some(waking_tid) = sem.up(tid) {
+                unsafe { (*processor).re_enque(waking_tid); }
             }
             0
         }
@@ -746,10 +907,21 @@ mod impls {
         /// P 操作：获取信号量，不可用则阻塞
         fn semaphore_down(&self, _caller: Caller, sem_id: usize) -> isize {
             let processor: *mut ProcessorInner = PROCESSOR.get_mut() as *mut ProcessorInner;
-            let current = unsafe { (*processor).current().unwrap() };
-            let tid = current.tid;
-            let current_proc = unsafe { (*processor).get_current_proc().unwrap() };
-            let sem = Arc::clone(current_proc.semaphore_list[sem_id].as_ref().unwrap());
+            let tid = unsafe { (*processor).current().unwrap().tid };
+            let (pid, deadlock_enabled, sem) = {
+                let current_proc = unsafe { (*processor).get_current_proc().unwrap() };
+                (
+                    current_proc.pid,
+                    current_proc.deadlock_detect_enabled,
+                    Arc::clone(current_proc.semaphore_list[sem_id].as_ref().unwrap()),
+                )
+            };
+            if deadlock_enabled {
+                let (avail, _, _) = sem.deadlock_snapshot();
+                if avail == 0 && detect_semaphore_deadlock(processor, pid, tid, sem_id) {
+                    return DEADLOCK_RET;
+                }
+            }
             if !sem.down(tid) { -1 } else { 0 }
         }
 
@@ -784,10 +956,21 @@ mod impls {
         /// 加锁，已被占用则阻塞
         fn mutex_lock(&self, _caller: Caller, mutex_id: usize) -> isize {
             let processor: *mut ProcessorInner = PROCESSOR.get_mut() as *mut ProcessorInner;
-            let current = unsafe { (*processor).current().unwrap() };
-            let tid = current.tid;
-            let current_proc = unsafe { (*processor).get_current_proc().unwrap() };
-            let mutex = Arc::clone(current_proc.mutex_list[mutex_id].as_ref().unwrap());
+            let tid = unsafe { (*processor).current().unwrap().tid };
+            let (pid, deadlock_enabled, mutex) = {
+                let current_proc = unsafe { (*processor).get_current_proc().unwrap() };
+                (
+                    current_proc.pid,
+                    current_proc.deadlock_detect_enabled,
+                    Arc::clone(current_proc.mutex_list[mutex_id].as_ref().unwrap()),
+                )
+            };
+            if deadlock_enabled
+                && mutex.holder().is_some()
+                && detect_mutex_deadlock(processor, pid, tid, mutex_id)
+            {
+                return DEADLOCK_RET;
+            }
             if !mutex.lock(tid) { -1 } else { 0 }
         }
 
@@ -832,10 +1015,14 @@ mod impls {
             if !flag { -1 } else { 0 }
         }
 
-        /// 死锁检测（TODO 练习题）
+        /// 死锁检测
         fn enable_deadlock_detect(&self, _caller: Caller, is_enable: i32) -> isize {
-            tg_console::log::info!("enable_deadlock_detect: is_enable = {is_enable}, not implemented");
-            -1
+            if is_enable != 0 && is_enable != 1 {
+                return -1;
+            }
+            let current_proc = PROCESSOR.get_mut().get_current_proc().unwrap();
+            current_proc.deadlock_detect_enabled = is_enable == 1;
+            0
         }
     }
 }
