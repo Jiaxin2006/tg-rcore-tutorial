@@ -1,9 +1,26 @@
 [package]
-name = "exp4-scheduler"
-description = "实验 4：可插拔调度算法实验套件（FCFS / SJF / RR / MLFQ / CFS-like）"
-version = "0.1.0"
+name = "jiaxin2006-tg-rcore-tutorial-t2l4"
+description = ""
+version = "0.0.1-preview.1"
 edition = "2024"
+authors = ["Jiaxin Han <hanjx23@mails.tsinghua.edu.cn>"]
+repository = "https://github.com/Jiaxin2006/tg-rcore-tutorial"
+homepage = "https://github.com/Jiaxin2006/tg-rcore-tutorial/tree/test/exp4_scheduler"
+documentation = "https://docs.rs/jiaxin2006-tg-rcore-tutorial-t2l4"
 license = "GPL-3.0"
+readme = "docs/exp4.md"
+keywords = ["ai", "ai4ose", "kernel", "learning", "os"]
+categories = ["no-std", "embedded"]
+exclude = [
+    "tg-user/**",
+#    ".cargo/config.toml",
+]
 
 [features]
-default = []
+coop = []
+exercise = []
+
+[[bin]]
+name = "jiaxin2006-tg-rcore-tutorial-t2l4"
+path = "src/main.rs"
+
