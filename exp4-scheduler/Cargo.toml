@@ -20,7 +20,4 @@ exclude = [
 coop = []
 exercise = []
 
-[[bin]]
-name = "jiaxin2006-tg-rcore-tutorial-t2l4"
-path = "src/main.rs"
 
