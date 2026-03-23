@@ -1,0 +1,6 @@
+[package]
+name = "exp7-realtime"
+description = "实验 7：实时调度 + 优先级反转与继承（RMS / EDF / PI）"
+version = "0.1.0"
+edition = "2024"
+license = "GPL-3.0"

@@ -351,4 +351,219 @@ cd ../tg-rcore-tutorial-ch8
 cargo publish --dry-run --features exercise
 cargo publish --features exercise
 
+## T2L4
+Q：@tg-rcore-tutorial/docs/exp4.md:1-21 
+请告诉我接口和数据采集如何实现，并给我提供函数框架
+A：你现在的 Schedule 只有 add/fetch 两个接口，适合“单一就绪队列”，但不够支持你实验里的多策略和统计。
 
+
+scheduler.rs
+Lines 2-7
+pub trait Schedule<I: Copy + Ord> {
+    /// 将任务 ID 放入就绪队列。
+    fn add(&mut self, id: I);
+    /// 从就绪队列取出下一个可运行任务 ID。
+    fn fetch(&mut self) -> Option<I>;
+}
+建议做成“两层”：
+
+策略层（可插拔）：enqueue / pick_next / on_tick / on_block / on_wakeup
+采集层（统一埋点）：每次状态变化/切换都记 SchedEvent，最后统一算指标
+1) 接口如何实现（策略插件）
+先定义策略 trait（可以替换原 Schedule，或者并存）：
+
+pub type Tick = u64;
+#[derive(Clone, Copy, Debug)]
+pub enum SchedDecision<I> {
+    KeepRunning,
+    Preempt,              // 当前任务应被抢占并重入队
+    SwitchTo(I),          // 直接切到指定任务（可选）
+}
+pub trait Scheduler<I: Copy + Ord> {
+    fn enqueue(&mut self, id: I, now: Tick);
+    fn pick_next(&mut self, now: Tick) -> Option<I>;
+    // 时钟中断调用，给策略机会触发抢占/时间片到期
+    fn on_tick(&mut self, current: I, now: Tick) -> SchedDecision<I>;
+    // 当前任务主动阻塞（如等待 IO）
+    fn on_block(&mut self, id: I, now: Tick);
+    // 阻塞任务被唤醒
+    fn on_wakeup(&mut self, id: I, now: Tick);
+    // 可选：任务退出时清理内部状态
+    fn on_exit(&mut self, _id: I, _now: Tick) {}
+}
+内核调度点统一这样调用：
+
+新建/就绪：enqueue
+调度：pick_next
+时钟中断：on_tick
+阻塞：on_block
+唤醒：on_wakeup
+2) 数据采集如何实现（统一事件流）
+2.1 事件结构（你实验要求的“时间戳、队列长度、运行片段”）
+#[derive(Clone, Copy, Debug)]
+pub enum EventKind {
+    Enqueue,
+    Dispatch,    // 选中开始运行
+    Tick,
+    Preempt,
+    Block,
+    Wakeup,
+    Exit,
+}
+#[derive(Clone, Copy, Debug)]
+pub struct SchedEvent<I: Copy> {
+    pub ts: Tick,
+    pub kind: EventKind,
+    pub task: Option<I>,
+    pub run_queue_len: usize,
+}
+2.2 采集器
+use alloc::collections::BTreeMap;
+use alloc::vec::Vec;
+#[derive(Default, Clone, Debug)]
+pub struct TaskStats {
+    pub first_enqueue_ts: Option<Tick>,
+    pub first_run_ts: Option<Tick>,
+    pub finish_ts: Option<Tick>,
+    pub run_ticks: u64,
+    pub wait_ticks: u64,
+    pub ctx_switches: u64,
+    // 交互延迟: wakeup -> next dispatch
+    pub last_wakeup_ts: Option<Tick>,
+    pub wakeup_latencies: Vec<u64>,
+    // 饥饿统计
+    pub starve_count: u64,
+}
+pub struct MetricsCollector<I: Copy + Ord> {
+    pub events: Vec<SchedEvent<I>>,
+    pub per_task: BTreeMap<I, TaskStats>,
+    pub last_ts: Tick,
+    pub running: Option<I>,
+    pub starvation_threshold: u64,
+}
+impl<I: Copy + Ord> MetricsCollector<I> {
+    pub fn new(starvation_threshold: u64) -> Self { /* ... */ }
+    pub fn record(&mut self, ev: SchedEvent<I>) {
+        // 1) push event
+        // 2) 根据上一个事件到本事件的 delta，累计 running.run_ticks / ready.wait_ticks
+        // 3) 更新 first_run / finish / wakeup latency / ctx_switches / starve_count
+        // 4) 更新 running 状态
+    }
+    pub fn summary(&self) -> ExperimentSummary {
+        // 计算:
+        // 平均等待时间, 平均周转时间, 吞吐量, P95/P99 wakeup latency, 饥饿次数
+        /* ... */
+    }
+}
+pub struct ExperimentSummary {
+    pub avg_wait: f64,
+    pub avg_turnaround: f64,
+    pub throughput: f64,
+    pub p95_latency: u64,
+    pub p99_latency: u64,
+    pub starvation_total: u64,
+}
+3) 调度器函数框架（可直接开始填）
+FCFS
+pub struct Fcfs<I: Copy + Ord> { /* VecDeque<I> */ }
+impl<I: Copy + Ord> Scheduler<I> for Fcfs<I> {
+    fn enqueue(&mut self, id: I, now: Tick) { /* push_back */ }
+    fn pick_next(&mut self, now: Tick) -> Option<I> { /* pop_front */ }
+    fn on_tick(&mut self, _current: I, _now: Tick) -> SchedDecision<I> { SchedDecision::KeepRunning }
+    fn on_block(&mut self, _id: I, _now: Tick) {}
+    fn on_wakeup(&mut self, id: I, now: Tick) { self.enqueue(id, now); }
+}
+SJF（简化非抢占）
+pub struct Sjf<I: Copy + Ord> {
+    // 需要任务估计运行时间: predicted_burst[id]
+}
+impl<I: Copy + Ord> Scheduler<I> for Sjf<I> {
+    fn enqueue(&mut self, id: I, now: Tick) { /* 按 burst 排序入队 */ }
+    fn pick_next(&mut self, now: Tick) -> Option<I> { /* 取最短 */ }
+    fn on_tick(&mut self, _current: I, _now: Tick) -> SchedDecision<I> { SchedDecision::KeepRunning }
+    fn on_block(&mut self, _id: I, _now: Tick) {}
+    fn on_wakeup(&mut self, id: I, now: Tick) { self.enqueue(id, now); }
+}
+RR
+pub struct Rr<I: Copy + Ord> {
+    pub quantum: u64,
+    pub remain: u64,
+    // ready queue...
+}
+impl<I: Copy + Ord> Scheduler<I> for Rr<I> {
+    fn enqueue(&mut self, id: I, now: Tick) { /* push_back */ }
+    fn pick_next(&mut self, now: Tick) -> Option<I> { /* pop_front + reset remain */ }
+    fn on_tick(&mut self, _current: I, _now: Tick) -> SchedDecision<I> {
+        // remain -= 1; remain == 0 => Preempt
+        /* ... */
+    }
+    fn on_block(&mut self, _id: I, _now: Tick) {}
+    fn on_wakeup(&mut self, id: I, now: Tick) { self.enqueue(id, now); }
+}
+MLFQ
+pub struct Mlfq<I: Copy + Ord, const N: usize> {
+    // queues[0..N), 每层不同 quantum
+}
+impl<I: Copy + Ord, const N: usize> Scheduler<I> for Mlfq<I, N> {
+    fn enqueue(&mut self, id: I, now: Tick) { /* 默认高优先级或按历史层级 */ }
+    fn pick_next(&mut self, now: Tick) -> Option<I> { /* 从高到低找非空队列 */ }
+    fn on_tick(&mut self, current: I, now: Tick) -> SchedDecision<I> {
+        // 时间片到 -> 降级 + Preempt
+        /* ... */
+    }
+    fn on_block(&mut self, _id: I, _now: Tick) {}
+    fn on_wakeup(&mut self, id: I, now: Tick) {
+        // 可选: 提升级别防饥饿
+        self.enqueue(id, now);
+    }
+}
+CFS-like（简化）
+pub struct CfsLike<I: Copy + Ord> {
+    // vruntime 最小者优先，可用 BTreeMap<(vruntime, id), ()>
+    // weight/nice 可简化为常数
+}
+impl<I: Copy + Ord> Scheduler<I> for CfsLike<I> {
+    fn enqueue(&mut self, id: I, now: Tick) { /* insert by vruntime */ }
+    fn pick_next(&mut self, now: Tick) -> Option<I> { /* pop min vruntime */ }
+    fn on_tick(&mut self, current: I, _now: Tick) -> SchedDecision<I> {
+        // vruntime += delta_exec * (1024/weight)
+        // 若当前不再最小 => Preempt
+        /* ... */
+    }
+    fn on_block(&mut self, _id: I, _now: Tick) {}
+    fn on_wakeup(&mut self, id: I, now: Tick) { self.enqueue(id, now); }
+}
+4) 实验统计公式（直接可用）
+turnaround = finish_ts - first_enqueue_ts
+waiting = turnaround - run_ticks
+throughput = finished_tasks / (experiment_end_ts - experiment_start_ts)
+交互延迟样本：每次 Wakeup -> Dispatch 差值，排序后取 P95/P99
+饥饿：某任务连续 ready 等待超过阈值计 1 次
+
+Q: starvation 这个东西是怎么定义的？是不是应该用最近一次 wait 的等待时间
+A: Starvation 怎么定义？
+不是累计等待总时长，而是单次连续等待是否超过阈值。
+
+一个任务可能经历多次"等待→运行→等待"循环，每一轮单独判定：
+
+Enqueue(t=0)  ──等待──  Dispatch(t=120)   ← 连续等了 120 tick，超阈值 → starvation_count += 1
+Preempt(t=130) ──等待──  Dispatch(t=135)   ← 只等了 5 tick，不算饥饿
+所以新增了 last_ready_since 字段：
+
+设置时机：Enqueue / Preempt / Wakeup（任务进入就绪队列的瞬间）
+检测时机：Dispatch（任务终于被选中运行时，算 now - last_ready_since）
+清除时机：Dispatch / Block / Exit（任务离开就绪队列）
+
+Q: Block 和 Preempt 有什么区别？
+A：Preempt 和 Block 的区别
+两者都是"任务不再运行"，但去向完全不同：
+
+Preempt（抢占）	Block（阻塞）
+触发原因	时间片到期 / 更高优先级任务到来	任务主动等 I/O、锁、sleep
+去向	回到就绪队列，随时可再被调度	离开就绪队列，进入阻塞态
+是否累计 wait_ticks	是（在队列里排队等 CPU）	否（在等 I/O，不是等 CPU）
+何时回来	下次 pick_next 选到它	等 I/O 完成，先收到 Wakeup 回到就绪队列
+所以代码里：
+
+Preempt：设 last_ready_since = Some(now)，is_blocked = false
+Block：设 is_blocked = true，清 last_ready_since = None

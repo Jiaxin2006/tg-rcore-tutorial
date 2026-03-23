@@ -1,0 +1,9 @@
+[package]
+name = "exp4-scheduler"
+description = "实验 4：可插拔调度算法实验套件（FCFS / SJF / RR / MLFQ / CFS-like）"
+version = "0.1.0"
+edition = "2024"
+license = "GPL-3.0"
+
+[features]
+default = []

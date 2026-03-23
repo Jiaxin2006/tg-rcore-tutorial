@@ -16,7 +16,13 @@ mod scheduler;
 
 pub use id::*;
 pub use manager::Manage;
-pub use scheduler::Schedule;
+pub use scheduler::{
+    CfsLikeScheduler, EventKind, ExperimentSummary, FcfsScheduler, MetricsCollector,
+    MlfqScheduler, PluggableScheduler, RrScheduler, SchedDecision, SchedEvent, Schedule,
+    SjfScheduler, TaskStats, Tick,
+};
+
+pub mod workload;
 
 #[cfg(feature = "proc")]
 mod proc_manage;
