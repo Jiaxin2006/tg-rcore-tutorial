@@ -1,6 +1,6 @@
 # 第一章：应用程序与基本执行环境
 
-本章实现了一个最简单的 RISC-V S 态裸机程序（tg-rcore-tutorial-ch1），展示操作系统的最小执行环境。程序在 QEMU 模拟的 RISC-V 64 硬件上运行，不依赖 OpenSBI 或 RustSBI，通过 `-bios none` 模式直接启动，打印 `Hello, world!` 后关机。
+本章实现了一个最简单的 RISC-V S 态裸机程序（tg-rcore-tutorial-ch1），展示操作系统的最小执行环境。程序在 QEMU 模拟的 RISC-V 64 硬件上运行，不依赖 OpenSBI 或 RustSBI，通过 `-bios none` 模式直接启动，初始化 VirtIO-GPU 后把七巧板 `OS` 图案绘制到 framebuffer，并保持 QEMU 窗口显示。
 
 通过本章的学习和实践，你将理解：
 
@@ -51,7 +51,7 @@ tg-rcore-tutorial-ch1/
 - [ ] 能在 `tg-rcore-tutorial-ch1` 目录执行 `cargo run`，看到 QEMU 图形窗口中的静态七巧板 `OS` 图案
 - [ ] 能解释 `#![no_std]` 与 `#![no_main]` 在裸机实验中的必要性
 - [ ] 能从 `src/main.rs` 说明 `_start -> rust_main -> panic_handler` 的控制流
-- [ ] 能说明 `src/tangram.rs` 中颜色常量与三角形顶点数组如何控制图案颜色和摆放位置
+- [ ] 能说明 `src/tangram.rs` 中颜色常量与 `O_PIECES` / `S_PIECES` 顶点数组如何控制图案颜色和摆放位置
 
 ## 概念-源码-测试三联表
 
@@ -198,8 +198,9 @@ Tangram OS rendered. Keep window open.
 终端会打印上述日志；QEMU 图形窗口中可看到静态七巧板 `OS` 图案。程序不会自动关机，便于你观察并调整图案。
 
 **如何调颜色和摆放：**
-- 颜色：修改 `src/tangram.rs` 中的颜色常量（如 `RED`、`CYAN`）
-- 位置：修改 `src/tangram.rs` 中 `PIECES_O` / `PIECES_S` 的三角形顶点坐标
+- 颜色：修改 `src/tangram.rs` 中的颜色常量（如 `RED`、`CYAN`、`MAGENTA`）
+- 位置：修改 `src/tangram.rs` 中 `O_PIECES` / `S_PIECES` 的顶点坐标
+- 图元类型：`Piece::Tri` 表示三角形，`Piece::Quad` 表示四边形（正方形/平行四边形）
 
 ---
 
@@ -379,10 +380,22 @@ tg-rcore-tutorial-ch1 通过 `use tg_sbi::{console_putchar, shutdown}` 引入了
 
 ```rust
 extern "C" fn rust_main() -> ! {
-    for c in b"Hello, world!\n" {
+    for c in b"Boot ch1 with VirtIO-GPU...\n" {
         console_putchar(*c);
     }
-    shutdown(false) // false 表示正常关机
+
+    // 初始化堆，供 virtio 队列和 framebuffer 相关对象使用
+    alloc_init(heap_ptr as usize);
+    alloc_transfer(heap_region);
+
+    let mut gpu = gpu::Gpu::new().unwrap();
+    gpu.render_once(|fb, width, height| {
+        tangram::render_tangram(fb, width, height);
+    }).unwrap();
+
+    loop {
+        core::hint::spin_loop();
+    }
 }
 ```
 
@@ -483,11 +496,14 @@ fn main() {
 - edition 2024 要求使用 `#[unsafe(no_mangle)]`、`#[unsafe(link_section = "...")]` 语法
 - 分配 4 KiB 栈空间，设置 `sp` 后跳转到 `rust_main`
 
-**主函数 `rust_main`（第 59-64 行）：**
-- 逐字节调用 `console_putchar` 输出 "Hello, world!\n"
-- 调用 `shutdown(false)` 正常关机
+**主函数 `rust_main`（中段主体逻辑）：**
+- 先输出启动日志，便于从串口观察执行进度
+- 初始化 `HEAP_SPACE` 对应的 no_std 堆分配器，供 VirtIO 队列和 GPU 驱动使用
+- 调用 `gpu::Gpu::new()` 初始化 VirtIO-GPU
+- 通过 `gpu.render_once(...)` 把 `tangram::render_tangram` 生成的像素写入 framebuffer
+- 渲染完成后进入自旋循环，保持 QEMU 图形窗口不退出
 
-**panic 处理（第 69-72 行）：**
+**panic 处理（文件后部）：**
 - 发生 panic 时调用 `shutdown(true)` 以异常方式关机
 
 **非 RISC-V 占位模块 `stub`（第 78-95 行）：**
@@ -499,7 +515,7 @@ fn main() {
 
 通过本章的学习和实践，你完成了从普通应用程序到裸机程序的蜕变过程：
 
-1. **理解了执行环境**：应用程序依赖多层执行环境（标准库 → 操作系统 → 硬件），`Hello, world!` 的背后并不简单
+1. **理解了执行环境**：应用程序依赖多层执行环境（标准库 → 操作系统 → 硬件），即便是最小的屏幕输出背后也有完整的启动与驱动链路
 2. **摆脱了标准库**：通过 `#![no_std]` 和 `#![no_main]`，让 Rust 程序不再依赖操作系统
 3. **掌握了裸机启动流程**：从 QEMU 加电到 M-mode 初始化，再到 S-mode 的 `_start` 入口
 4. **认识了 RISC-V 特权级和 SBI**：M-mode / S-mode / U-mode 的层次关系，以及 `ecall` 指令如何跨越特权级
@@ -537,7 +553,7 @@ fn main() {
 
 | 操作系统内核 | 所涉及核心知识点 | 主要完成功能 | 所依赖的组件 |
 |:-----|:------------|:---------|:---------------|
-| **tg-rcore-tutorial-ch1** | 应用程序执行环境<br>裸机编程（Bare-metal）<br>SBI（Supervisor Binary Interface）<br>RISC-V 特权级（M/S-mode）<br>链接脚本（Linker Script）<br>内存布局（Memory Layout）<br>Panic 处理 | 最小 S-mode 裸机程序<br>QEMU 直接启动（无 OpenSBI）<br>打印 "Hello, world!" 并关机<br>演示最基本的 OS 执行环境 | tg-rcore-tutorial-sbi |
+| **tg-rcore-tutorial-ch1** | 应用程序执行环境<br>裸机编程（Bare-metal）<br>SBI（Supervisor Binary Interface）<br>RISC-V 特权级（M/S-mode）<br>链接脚本（Linker Script）<br>内存布局（Memory Layout）<br>Panic 处理<br>VirtIO-GPU / framebuffer | 最小 S-mode 裸机程序<br>QEMU 直接启动（无 OpenSBI）<br>初始化 VirtIO-GPU 并显示七巧板 `OS` 图案<br>演示最基本的 OS 执行环境与图形输出链路 | tg-rcore-tutorial-sbi |
 | **tg-rcore-tutorial-ch2** | 批处理系统（Batch Processing）<br>特权级切换（U-mode ↔ S-mode）<br>Trap 处理（ecall / 异常）<br>上下文保存与恢复<br>系统调用（write / exit）<br>用户态 / 内核态<br>`sret` 返回指令 | 批处理操作系统<br>顺序加载运行多个用户程序<br>特权级切换和 Trap 处理框架<br>实现 write / exit 系统调用 | tg-rcore-tutorial-sbi<br>tg-rcore-tutorial-linker<br>tg-rcore-tutorial-console<br>tg-rcore-tutorial-kernel-context<br>tg-rcore-tutorial-syscall |
 | **tg-rcore-tutorial-ch3** | 多道程序（Multiprogramming）<br>任务控制块（TCB）<br>协作式调度（yield）<br>抢占式调度（Preemptive）<br>时钟中断（Clock Interrupt）<br>时间片轮转（Time Slice）<br>任务切换（Task Switch）<br>任务状态（Ready/Running/Finished）<br>clock_gettime 系统调用 | 多道程序与分时多任务<br>多程序同时驻留内存<br>协作式 + 抢占式调度<br>时钟中断与时间管理 | tg-rcore-tutorial-sbi<br>tg-rcore-tutorial-linker<br>tg-rcore-tutorial-console<br>tg-rcore-tutorial-kernel-context<br>tg-rcore-tutorial-syscall |
 | **tg-rcore-tutorial-ch4** | 虚拟内存（Virtual Memory）<br>Sv39 三级页表（Page Table）<br>地址空间隔离（Address Space）<br>页表项（PTE）与标志位<br>地址转换（VA → PA）<br>异界传送门（MultislotPortal）<br>ELF 加载与解析<br>堆管理（sbrk）<br>恒等映射（Identity Mapping）<br>内存保护（Memory Protection）<br>satp CSR | 引入 Sv39 虚拟内存<br>每个用户进程独立地址空间<br>跨地址空间上下文切换<br>进程隔离和内存保护 | tg-rcore-tutorial-sbi<br>tg-rcore-tutorial-linker<br>tg-rcore-tutorial-console<br>tg-rcore-tutorial-kernel-context<br>tg-rcore-tutorial-kernel-alloc<br>tg-rcore-tutorial-kernel-vm<br>tg-rcore-tutorial-syscall |
