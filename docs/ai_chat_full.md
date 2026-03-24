@@ -570,3 +570,37 @@ Block：设 is_blocked = true，清 last_ready_since = None
 
 ## T2L5
 
+Q: 每个同步原语都给一个“能失败的对照测试”（例如故意去掉 wakeup 或 unlock 顺序，测试就挂）
+A: 先看下现有反向测试的完整范围，再补全缺失的。
+
+现有反向测试覆盖情况：
+
+原语	现有反向测试	缺失
+SpinLock	无	需要
+MutexBlocking	test_negative_missing_unlock_timeout	有，但用的是 lock() 非阻塞接口，不够直观
+Semaphore	test_negative_semaphore_over_down	有，但只是检查状态，不是"会挂"的演示
+Condvar	无	需要
+RwLock	无	需要
+设计思路：每个反向测试都在子线程里故意不 unlock/signal，主线程用超时检测到"被挂住"的事实，打印诊断信息，测试本身正常通过（不会真的挂死）。
+
+Q: @/Users/hanjiaxin/.cursor/projects/Users-hanjiaxin-Desktop-tg-rcore-tutorial/terminals/2.txt:35-36 这里 spin 好像卡住了，请检查锁的释放情况
+A: 找到问题了。SpinLock::acquire 使用纯自旋等待，当 cargo test 并行运行 19 个测试（每个都产生多线程）时，自旋线程会疯狂消耗 CPU，导致持锁线程反而得不到 CPU 时间来释放锁，形成类似活锁的状态。
+
+核心问题在 primitives.rs 第 65-74 行：
+
+
+primitives.rs
+Lines 65-74
+    pub fn acquire(&self, tid: ThreadId) {
+        while self
+            .locked
+            .compare_exchange_weak(false, true, Ordering::Acquire, Ordering::Relaxed)
+            .is_err()
+        {
+            std::hint::spin_loop();
+        }
+        *self.holder.lock().unwrap() = Some(tid);
+    }
+spin_loop() 只是一个 CPU hint，不会让出时间片。多线程争抢时，失败的线程持续烧 CPU，持锁线程饿死，程序就卡住了。
+
+修复方法：加一个自旋上限，超过后 yield_now() 让出 CPU，让持锁线程有机会运行并释放锁。

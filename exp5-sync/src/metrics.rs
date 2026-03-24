@@ -239,21 +239,29 @@ impl<M: Mutex> InstrumentedMutex<M> {
         self.inner.unlock()
     }
 
-    /// 阻塞式获取：自旋等待直到获取成功，记录等待时间。
+    /// 阻塞式获取：先调用一次 `lock(tid)`，若失败则轮询 `holder()`
+    /// 等待 `unlock()` 将锁转移给自己（tid 已在队列中，不会重复入队）。
     pub fn blocking_lock(&self, tid: ThreadId) {
         let wait_start = Instant::now();
         if self.inner.lock(tid) {
             self.record_acquire(tid);
             return;
         }
-        // 需要等待
+        let mut spins: u32 = 0;
         loop {
-            std::thread::yield_now();
-            if self.inner.lock(tid) {
+            if self.inner.holder() == Some(tid) {
                 let wait_us = wait_start.elapsed().as_micros() as u64;
                 self.record_wait(tid, wait_us);
                 self.record_acquire(tid);
                 return;
+            }
+            spins += 1;
+            if spins < 4 {
+                std::hint::spin_loop();
+            } else if spins < 10 {
+                std::thread::yield_now();
+            } else {
+                std::thread::sleep(std::time::Duration::from_micros(1));
             }
         }
     }

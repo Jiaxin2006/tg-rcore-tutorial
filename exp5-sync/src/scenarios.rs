@@ -112,6 +112,9 @@ pub fn producer_consumer(
         }));
     }
 
+    let per_consumer = total_items / n_consumers;
+    let remainder = total_items % n_consumers;
+
     for cid in 0..n_consumers {
         let mutex = Arc::clone(&mutex);
         let empty = Arc::clone(&empty);
@@ -120,14 +123,11 @@ pub fn producer_consumer(
         let consumed = Arc::clone(&consumed);
         let metrics = Arc::clone(&metrics);
         let tid_base = n_producers + cid + 1;
+        let my_quota = per_consumer + if cid < remainder { 1 } else { 0 };
 
         handles.push(thread::spawn(move || {
             let mut local_metrics = SyncMetrics::default();
-            loop {
-                if consumed.load(Ordering::Relaxed) >= total_items {
-                    break;
-                }
-
+            for _ in 0..my_quota {
                 let wait_start = Instant::now();
                 full.acquire(tid_base);
                 let wait_us = wait_start.elapsed().as_micros() as u64;
@@ -153,10 +153,6 @@ pub fn producer_consumer(
 
                 mutex.release();
                 empty.release(tid_base);
-
-                if consumed.load(Ordering::Relaxed) >= total_items {
-                    break;
-                }
             }
             *local_metrics
                 .per_thread_wait_us
@@ -429,6 +425,9 @@ pub struct DiningPhilosophersResult {
 /// - `meals`：每个哲学家进餐次数
 /// - `timeout`：超时时间（用于死锁检测）
 /// - `use_ordered`：是否使用有序获取（避免死锁）
+///
+/// 使用 `try_acquire_timeout` 获取叉子，使死锁时线程能超时退出
+/// 而非永久阻塞（否则 `join()` 会无限等待）。
 pub fn dining_philosophers(
     n_philosophers: usize,
     meals: usize,
@@ -441,6 +440,8 @@ pub fn dining_philosophers(
     let total_meals = Arc::new(AtomicUsize::new(0));
     let metrics = Arc::new(std::sync::Mutex::new(SyncMetrics::default()));
     let deadlock = Arc::new(AtomicBool::new(false));
+
+    let fork_timeout = Duration::from_millis(200);
 
     let start = Instant::now();
     let mut handles = Vec::new();
@@ -461,8 +462,7 @@ pub fn dining_philosophers(
                 }
 
                 let (first, second) = if use_ordered {
-                    // 有序获取：总是先拿编号小的叉子
-                    if id < (id + 1) % (id + n_philosophers) {
+                    if id < (id + 1) % n_philosophers {
                         (&left, &right)
                     } else {
                         (&right, &left)
@@ -472,16 +472,24 @@ pub fn dining_philosophers(
                 };
 
                 let wait_start = Instant::now();
-                first.acquire(tid);
+                if !first.try_acquire_timeout(tid, fork_timeout) {
+                    if deadlock.load(Ordering::Relaxed) { break; }
+                    local.contention_count += 1;
+                    continue;
+                }
                 let w1 = wait_start.elapsed().as_micros() as u64;
 
-                // 短暂思考，增加死锁概率（无序模式下）
                 if !use_ordered {
                     thread::yield_now();
                 }
 
                 let wait_start2 = Instant::now();
-                second.acquire(tid);
+                if !second.try_acquire_timeout(tid, fork_timeout) {
+                    first.release();
+                    if deadlock.load(Ordering::Relaxed) { break; }
+                    local.contention_count += 1;
+                    continue;
+                }
                 let w2 = wait_start2.elapsed().as_micros() as u64;
 
                 let wait_total = w1 + w2;
@@ -493,7 +501,6 @@ pub fn dining_philosophers(
                 }
                 local.acquire_count += 1;
 
-                // 进餐
                 spin_work(10);
                 total_meals.fetch_add(1, Ordering::Relaxed);
 
@@ -506,7 +513,6 @@ pub fn dining_philosophers(
         }));
     }
 
-    // 超时检测
     let deadlock_flag = Arc::clone(&deadlock);
     let total_expected = n_philosophers * meals;
     let total_ref = Arc::clone(&total_meals);
@@ -514,7 +520,7 @@ pub fn dining_philosophers(
         let deadline = Instant::now() + timeout;
         let mut last_count = 0;
         loop {
-            thread::sleep(Duration::from_millis(50));
+            thread::sleep(Duration::from_millis(100));
             let current = total_ref.load(Ordering::Relaxed);
             if current >= total_expected {
                 return false;
@@ -523,7 +529,7 @@ pub fn dining_philosophers(
                 deadlock_flag.store(true, Ordering::Relaxed);
                 return true;
             }
-            if current == last_count && Instant::now() > deadline - Duration::from_millis(100) {
+            if current == last_count && Instant::now() > deadline - Duration::from_millis(200) {
                 deadlock_flag.store(true, Ordering::Relaxed);
                 return true;
             }

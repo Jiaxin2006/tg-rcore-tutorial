@@ -13,5 +13,4 @@ keywords = ["ai", "ai4ose", "kernel", "learning", "os"]
 categories = ["algorithms", "simulation"]
 exclude = [
     "target/**",
-    "scripts/**",
 ]

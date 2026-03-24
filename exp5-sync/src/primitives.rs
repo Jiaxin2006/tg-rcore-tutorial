@@ -62,15 +62,39 @@ impl SpinLock {
     }
 
     /// 自旋获取锁（阻塞式，实际自旋等待直到成功）。
+    ///
+    /// 采用 TTAS + 指数退避：先只读轮询，看到空闲后才 CAS；
+    /// 失败次数增多时从 spin_loop → yield → sleep 逐级退避，
+    /// 保证在用户态（尤其 debug 无优化 + macOS ARM64）下也能推进。
     pub fn acquire(&self, tid: ThreadId) {
-        while self
-            .locked
-            .compare_exchange_weak(false, true, Ordering::Acquire, Ordering::Relaxed)
-            .is_err()
-        {
-            std::hint::spin_loop();
+        let mut failures: u32 = 0;
+        loop {
+            // TTAS: 只读检查，避免写争抢缓存行
+            if self.locked.load(Ordering::Relaxed) {
+                Self::backoff(failures);
+                failures = failures.saturating_add(1);
+                continue;
+            }
+            if self
+                .locked
+                .compare_exchange_weak(false, true, Ordering::Acquire, Ordering::Relaxed)
+                .is_ok()
+            {
+                *self.holder.lock().unwrap() = Some(tid);
+                return;
+            }
+            failures = failures.saturating_add(1);
         }
-        *self.holder.lock().unwrap() = Some(tid);
+    }
+
+    fn backoff(failures: u32) {
+        if failures < 4 {
+            std::hint::spin_loop();
+        } else if failures < 10 {
+            std::thread::yield_now();
+        } else {
+            std::thread::sleep(std::time::Duration::from_micros(1));
+        }
     }
 
     /// 释放自旋锁。
@@ -194,13 +218,13 @@ impl MutexBlocking {
     pub fn release(&self) -> Option<ThreadId> {
         let mut inner = self.inner.lock().unwrap();
         assert!(inner.locked);
+        inner.locked = false;
+        inner.holder = None;
         if let Some(waking) = inner.wait_queue.pop_front() {
-            inner.holder = Some(waking);
+            drop(inner);
             self.condvar.notify_all();
             Some(waking)
         } else {
-            inner.locked = false;
-            inner.holder = None;
             None
         }
     }
