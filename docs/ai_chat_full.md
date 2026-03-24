@@ -567,3 +567,6 @@ Preempt（抢占）	Block（阻塞）
 
 Preempt：设 last_ready_since = Some(now)，is_blocked = false
 Block：设 is_blocked = true，清 last_ready_since = None
+
+## T2L5
+
