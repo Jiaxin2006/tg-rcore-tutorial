@@ -27,6 +27,16 @@
 // 引入 SBI 调用库，提供 console_putchar（输出字符）和 shutdown（关机）功能
 // 启用 nobios 特性后，tg_sbi 内建了 M-mode 启动代码，无需外部 SBI 固件
 use tg_sbi::{console_putchar, shutdown};
+#[cfg(target_arch = "riscv64")]
+use tg_kernel_alloc::{init as alloc_init, transfer as alloc_transfer};
+#[cfg(target_arch = "riscv64")]
+mod gpu;
+#[cfg(target_arch = "riscv64")]
+mod tangram;
+
+#[cfg(target_arch = "riscv64")]
+#[unsafe(link_section = ".bss.uninit")]
+static mut HEAP_SPACE: [u8; 2 * 1024 * 1024] = [0; 2 * 1024 * 1024];
 
 /// S 态程序入口点。
 ///
@@ -63,10 +73,58 @@ unsafe extern "C" fn _start() -> ! {
 /// 通过 SBI 的 `console_putchar` 逐字节输出字符串，
 /// 然后调用 `shutdown` 正常关机退出 QEMU。
 extern "C" fn rust_main() -> ! {
-    for c in b"Hello, world!\n" {
+    for c in b"Hello World!\n" {
         console_putchar(*c);
     }
-    shutdown(false) // false 表示正常关机
+
+    for c in b"Boot ch1 with VirtIO-GPU...\n" {
+        console_putchar(*c);
+    }
+
+    let heap_ptr = core::ptr::addr_of_mut!(HEAP_SPACE) as *mut u8;
+    alloc_init(heap_ptr as usize);
+    unsafe {
+        let heap_region = core::slice::from_raw_parts_mut(heap_ptr, 2 * 1024 * 1024);
+        alloc_transfer(heap_region);
+    }
+
+    for c in b"Initializing GPU...\n" {
+        console_putchar(*c);
+    }
+
+    let mut gpu = match gpu::Gpu::new() {
+        Ok(gpu) => gpu,
+        Err(_e) => {
+            for c in b"GPU init failed.\n" {
+                console_putchar(*c);
+            }
+            shutdown(true);
+        }
+    };
+
+    for c in b"Rendering tangram...\n" {
+        console_putchar(*c);
+    }
+
+    if gpu
+        .render_once(|fb, width, height| {
+            tangram::render_tangram(fb, width, height);
+        })
+        .is_err()
+    {
+        for c in b"GPU render failed.\n" {
+            console_putchar(*c);
+        }
+        shutdown(true);
+    }
+
+    for c in b"Tangram OS rendered. Keep window open.\n" {
+        console_putchar(*c);
+    }
+
+    loop {
+        core::hint::spin_loop();
+    }
 }
 
 /// panic 处理函数。

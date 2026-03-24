@@ -48,10 +48,10 @@ tg-rcore-tutorial-ch1/
 
 ## DoD 验收标准（本章完成判据）
 
-- [ ] 能在 `tg-rcore-tutorial-ch1` 目录执行 `cargo run`，看到 `Hello, world!` 并正常关机退出
+- [ ] 能在 `tg-rcore-tutorial-ch1` 目录执行 `cargo run`，看到 QEMU 图形窗口中的静态七巧板 `OS` 图案
 - [ ] 能解释 `#![no_std]` 与 `#![no_main]` 在裸机实验中的必要性
 - [ ] 能从 `src/main.rs` 说明 `_start -> rust_main -> panic_handler` 的控制流
-- [ ] 能说明 `tg-rcore-tutorial-sbi` 在本章承担的最小职责（输出字符与关机）
+- [ ] 能说明 `src/tangram.rs` 中颜色常量与三角形顶点数组如何控制图案颜色和摆放位置
 
 ## 概念-源码-测试三联表
 
@@ -170,7 +170,8 @@ cargo run
 ```bash
 qemu-system-riscv64 \
     -machine virt \
-    -nographic \
+    -serial mon:stdio \
+    -device virtio-gpu-device \
     -bios none \
     -kernel target/riscv64gc-unknown-none-elf/debug/tg-rcore-tutorial-ch1
 ```
@@ -180,17 +181,25 @@ qemu-system-riscv64 \
 | 参数 | 说明 |
 |------|------|
 | `-machine virt` | 使用 QEMU 的 `virt` 虚拟平台，这是一个通用的 RISC-V 虚拟机 |
-| `-nographic` | 无图形界面，所有输出通过串口重定向到终端 |
+| `-serial mon:stdio` | 串口输出重定向到终端，便于看启动日志 |
+| `-device virtio-gpu-device` | 挂载 VirtIO-GPU 设备，为 framebuffer 渲染提供显示硬件 |
 | `-bios none` | 不加载任何 BIOS/SBI 固件，tg-rcore-tutorial-ch1 自带 M-mode 启动代码 |
 | `-kernel <文件>` | 将 ELF 可执行文件加载到内存中作为内核启动 |
 
 ### 2.3 预期输出
 
 ```
-Hello, world!
+Boot ch1 with VirtIO-GPU...
+Initializing GPU...
+Rendering tangram...
+Tangram OS rendered. Keep window open.
 ```
 
-输出一行 `Hello, world!` 后，QEMU 自动退出。这是因为程序通过 SBI 调用执行了关机操作。
+终端会打印上述日志；QEMU 图形窗口中可看到静态七巧板 `OS` 图案。程序不会自动关机，便于你观察并调整图案。
+
+**如何调颜色和摆放：**
+- 颜色：修改 `src/tangram.rs` 中的颜色常量（如 `RED`、`CYAN`）
+- 位置：修改 `src/tangram.rs` 中 `PIECES_O` / `PIECES_S` 的三角形顶点坐标
 
 ---
 
@@ -277,10 +286,11 @@ PC = 0x1000（QEMU 内置引导代码）
     │  ── 设置栈指针 sp
     ▼
 跳转到 rust_main()
-    │  ── 打印 "Hello, world!"
-    │  ── 调用 SBI shutdown 关机
+    │  ── 初始化内存分配器与 VirtIO-GPU
+    │  ── 把七巧板像素写入 framebuffer 并 flush 到 scanout
+    │  ── 进入自旋循环保持窗口显示
     ▼
-QEMU 退出
+QEMU 持续运行（直到手动关闭）
 ```
 
 **关键地址：**
@@ -363,9 +373,9 @@ tg-rcore-tutorial-ch1 通过 `use tg_sbi::{console_putchar, shutdown}` 引入了
 | 函数 | 说明 |
 |------|------|
 | `console_putchar(c)` | 向控制台输出一个字符（通过串口） |
-| `shutdown(fail)` | 关闭虚拟机（`fail=false` 正常关机，`fail=true` 异常关机） |
+| `shutdown(fail)` | 出错时关闭虚拟机（`fail=true` 异常关机） |
 
-`rust_main` 的实现非常简洁——逐字符输出 "Hello, world!\n"，然后关机：
+`rust_main` 的流程变为：打印启动日志 → 初始化 allocator 与 GPU → 调用 `tangram::render_tangram` 写 framebuffer → `flush` → 自旋保持窗口显示。
 
 ```rust
 extern "C" fn rust_main() -> ! {
@@ -394,7 +404,8 @@ target = "riscv64gc-unknown-none-elf"
 runner = [
     "qemu-system-riscv64",
     "-machine", "virt",
-    "-nographic",
+    "-serial", "mon:stdio",
+    "-device", "virtio-gpu-device",
     "-bios", "none",
     "-kernel",
 ]
@@ -418,13 +429,17 @@ panic = "abort"
 panic = "abort"
 
 [dependencies]
-tg-rcore-tutorial-sbi = { version = "0.1.0-preview.1", features = ["nobios"] }
+tg-sbi = { package = "tg-rcore-tutorial-sbi", features = ["nobios"] }
+virtio-drivers = "0.1.0"
+tg-kernel-alloc = { package = "tg-rcore-tutorial-kernel-alloc" }
 ```
 
 关键配置：
 - `edition = "2024"`：使用 Rust 2024 edition，要求 unsafe 属性使用 `unsafe(...)` 包装
 - `panic = "abort"`：panic 时直接终止，不进行栈展开（unwinding），减少裸机程序的复杂度
-- `tg-rcore-tutorial-sbi` 依赖启用了 `nobios` 特性，使其内建 M-mode 启动代码
+- `tg-sbi` 启用 `nobios`：内建 M-mode 启动代码
+- `virtio-drivers`：提供 VirtIO-GPU 设备驱动能力
+- `tg-kernel-alloc`：提供 no_std 全局分配器，满足 virtio 队列内存分配
 
 ### 4.3 `build.rs` —— 构建脚本
 
