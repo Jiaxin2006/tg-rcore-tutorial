@@ -27,7 +27,9 @@ tg-rcore-tutorial-ch1/
 ├── Cargo.toml          # 项目配置与依赖
 ├── README.md           # 本文档
 └── src/
-    └── main.rs         # 程序源码：入口、主函数、panic 处理
+    ├── main.rs         # 程序入口：启动、堆初始化、GPU 初始化与总控流程
+    ├── gpu.rs          # VirtIO-GPU 最小封装：探测设备、获取 framebuffer、flush
+    └── tangram.rs      # 七巧板图元、颜色常量、栅格化与渲染接口
 ```
 
 <a id="source-nav"></a>
@@ -36,13 +38,15 @@ tg-rcore-tutorial-ch1/
 
 [返回根文档导航总表](../README.md#chapters-source-nav-map)
 
-建议把本章源码阅读聚焦在一个文件：`src/main.rs`。
+建议把本章源码阅读聚焦在三个文件：`src/main.rs`、`src/gpu.rs`、`src/tangram.rs`。
 
 | 阅读顺序 | 位置 | 重点问题 |
 |---|---|---|
-| 1 | `_start` | 为什么裸机入口要手动设栈，且不能依赖标准运行时？ |
-| 2 | `rust_main` | 最小执行环境中，`console_putchar` 和 `shutdown` 如何构成完整闭环？ |
-| 3 | `panic_handler` | `#![no_std]` 下发生异常时，系统如何收口与退出？ |
+| 1 | `src/main.rs` 的 `_start` | 为什么裸机入口要手动设栈，且不能依赖标准运行时？ |
+| 2 | `src/main.rs` 的 `rust_main` | 堆初始化、GPU 初始化、七巧板渲染是如何串起来的？ |
+| 3 | `src/gpu.rs` | VirtIO-GPU 是如何被探测、初始化并暴露 framebuffer 的？ |
+| 4 | `src/tangram.rs` | `O_PIECES` / `S_PIECES`、`Piece::Tri` / `Piece::Quad` 如何决定图案形状？ |
+| 5 | `panic_handler` | `#![no_std]` 下发生异常时，系统如何收口与退出？ |
 
 配套建议：阅读 `tg-rcore-tutorial-sbi/src/lib.rs` 中的 SBI 调用封装，理解 `console_putchar`/`shutdown` 的底层调用路径。
 
@@ -52,6 +56,7 @@ tg-rcore-tutorial-ch1/
 - [ ] 能解释 `#![no_std]` 与 `#![no_main]` 在裸机实验中的必要性
 - [ ] 能从 `src/main.rs` 说明 `_start -> rust_main -> panic_handler` 的控制流
 - [ ] 能说明 `src/tangram.rs` 中颜色常量与 `O_PIECES` / `S_PIECES` 顶点数组如何控制图案颜色和摆放位置
+- [ ] 能说明 `o_pieces()` / `s_pieces()` / `render_piece()` / `render_progressive()` 为什么便于后续 `ch2` 做逐块动态显示
 
 ## 概念-源码-测试三联表
 
@@ -201,6 +206,14 @@ Tangram OS rendered. Keep window open.
 - 颜色：修改 `src/tangram.rs` 中的颜色常量（如 `RED`、`CYAN`、`MAGENTA`）
 - 位置：修改 `src/tangram.rs` 中 `O_PIECES` / `S_PIECES` 的顶点坐标
 - 图元类型：`Piece::Tri` 表示三角形，`Piece::Quad` 表示四边形（正方形/平行四边形）
+
+**为 `ch2` 扩展预留的接口：**
+- `o_pieces()` / `s_pieces()`：返回 `O` 与 `S` 的有序拼图块切片
+- `render_piece()`：只绘制一块，适合做更细粒度的动画逻辑
+- `render_pieces()`：绘制一组 piece，适合批量重绘
+- `render_progressive(fb, width, height, o_count, s_count)`：按“先 `O`、后 `S`”的顺序渲染前缀块数，最适合 `ch2` 的分步显示
+
+在本仓库后续的 `ch2` 实现中，内核正是复用了这些接口：用户程序通过 `write(fd = 100, &[piece_id])` 发送“绘制第几块”的请求，内核收到后把 `piece_id` 转成 `(o_count, s_count)`，再调用 `render_progressive()` 重绘 framebuffer，从而实现“一个程序对应一块”的动态拼接效果。
 
 ---
 
@@ -376,7 +389,7 @@ tg-rcore-tutorial-ch1 通过 `use tg_sbi::{console_putchar, shutdown}` 引入了
 | `console_putchar(c)` | 向控制台输出一个字符（通过串口） |
 | `shutdown(fail)` | 出错时关闭虚拟机（`fail=true` 异常关机） |
 
-`rust_main` 的流程变为：打印启动日志 → 初始化 allocator 与 GPU → 调用 `tangram::render_tangram` 写 framebuffer → `flush` → 自旋保持窗口显示。
+`rust_main` 的流程变为：打印启动日志 → 初始化 allocator 与 GPU → 调用 `tangram::render_tangram` 写 framebuffer → `flush` → 自旋保持窗口显示。与此同时，`tangram.rs` 还额外提供了逐块渲染接口，便于下一章把静态图扩展成动态拼接动画。
 
 ```rust
 extern "C" fn rust_main() -> ! {

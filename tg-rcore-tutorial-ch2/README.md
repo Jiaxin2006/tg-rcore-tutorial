@@ -30,8 +30,11 @@ ch2/
 ├── Cargo.toml          # 项目配置与依赖
 ├── README.md           # 本文档
 ├── test.sh             # 自动测试脚本
+├── tg-rcore-tutorial-user/ # 本地用户程序 crate：原有用例 + 13 个 tangram app
 └── src/
-    └── main.rs         # 内核源码：批处理主循环、Trap 处理、系统调用
+    ├── main.rs         # 内核源码：批处理主循环、Trap 处理、系统调用、绘图请求分发
+    ├── gpu.rs          # VirtIO-GPU 持久化封装：framebuffer 初始化与 flush
+    └── tangram.rs      # 复用 ch1 的七巧板图元与 progressive 渲染接口
 ```
 
 <a id="source-nav"></a>
@@ -40,7 +43,7 @@ ch2/
 
 [返回根文档导航总表](../README.md#chapters-source-nav-map)
 
-本章建议围绕 `src/main.rs` 建立“批处理 + Trap + 系统调用”主线。
+本章建议围绕 `src/main.rs` 建立“批处理 + Trap + 系统调用”主线，再结合 `src/gpu.rs` / `src/tangram.rs` 理解这次扩展进去的逐块图形显示。
 
 | 阅读顺序 | 位置 | 重点问题 |
 |---|---|---|
@@ -48,6 +51,8 @@ ch2/
 | 2 | Trap 分支（`scause` 匹配） | 用户态 `ecall` 与异常进入内核后，分支逻辑如何区分？ |
 | 3 | `handle_syscall` | `a7`/`a0~a5`/`a0` 的系统调用寄存器约定如何落到代码中？ |
 | 4 | `impls` 模块 | `IO` / `Process` trait 如何与 syscall 分发层对接？ |
+| 5 | `tangram_draw()` 与 `DRAW_FD` | 为什么不用改共享 syscall crate，也能把“绘制一块”接入 ch2？ |
+| 6 | `src/gpu.rs` / `src/tangram.rs` | framebuffer 为什么要持久化？`render_progressive()` 如何把 piece_id 转成前缀渲染？ |
 
 配套建议：结合 `tg-rcore-tutorial-kernel-context` 和 `tg-rcore-tutorial-syscall` 的注释阅读，理解上下文切换与 syscall 分发的职责边界。
 
@@ -57,7 +62,9 @@ ch2/
 - [ ] 能解释 U/S 特权级切换与 `ecall` 触发 Trap 的基本路径
 - [ ] 能从代码定位 syscall 参数来源（`a0~a5`）与 syscall 号来源（`a7`）
 - [ ] 能说明为什么 syscall 返回前需要 `sepc += 4`（跳过 `ecall` 指令）
-- [ ] 能执行 `./test.sh base` 并通过基础测试
+- [ ] 能说明 `fd = 100` 的绘图协议如何复用 `write` 系统调用完成逐块七巧板显示
+- [ ] 能说明为什么 `cases.toml` 中的 `base` 需要改到 `0x8400_0000` 才能避免 GPU DMA/BSS 覆盖用户程序
+- [ ] 能执行 `./test.sh` 并通过基础测试
 
 ## 概念-源码-测试三联表
 
@@ -67,6 +74,7 @@ ch2/
 | Trap 分发 | `tg-rcore-tutorial-ch2/src/main.rs` 中 `scause::read().cause()` 匹配分支 | 非法行为可被识别并输出错误日志 |
 | 系统调用参数约定 | `tg-rcore-tutorial-ch2/src/main.rs` 的 `handle_syscall` | `write/exit` 行为与预期一致 |
 | syscall trait 对接 | `tg-rcore-tutorial-ch2/src/main.rs` 的 `impls` 模块 | `STDOUT` 可输出，非法 fd 被拒绝 |
+| 渐进式图形渲染 | `tg-rcore-tutorial-ch2/src/main.rs` 的 `tangram_draw`；`src/tangram.rs` 的 `render_progressive` | 日志中出现 `pieces shown: 1` 到 `pieces shown: 13` |
 
 遇到构建/运行异常可先查看根文档的“高频错误速查表”。
 
@@ -161,7 +169,7 @@ cargo build
 
 > 环境变量说明：
 > - `TG_USER_DIR`：指定本地 tg-rcore-tutorial-user 源码路径（跳过自动下载）
-> - `TG_USER_VERSION`：指定 tg-rcore-tutorial-user 版本（默认 `0.2.0-preview.1`）
+> - `TG_USER_VERSION`：指定 tg-rcore-tutorial-user 版本（当前配置为 `0.4.8`）
 > - `TG_SKIP_USER_APPS`：设置后跳过用户程序编译（生成空的占位 APP_ASM）
 > - `LOG`：设置日志级别（如 `LOG=INFO`、`LOG=TRACE`）
 
@@ -176,29 +184,50 @@ cargo run
 ```bash
 qemu-system-riscv64 \
     -machine virt \
-    -nographic \
+    -display cocoa \
+    -serial mon:stdio \
+    -device virtio-gpu-device \
     -bios none \
-    -kernel target/riscv64gc-unknown-none-elf/debug/tg-rcore-tutorial-ch2
+    -kernel target/riscv64gc-unknown-none-elf/debug/jiaxin2006-tg-rcore-tutorial-t3l2
 ```
 
 ### 2.3 预期输出
 
-```
-[tg-rcore-tutorial-ch2 0.3.1-preview.1] Hello, world!
-[ INFO] .data [0x802xxxxx, 0x802xxxxx)
-[ WARN] boot_stack top=bottom=0x802xxxxx, lower_bound=0x802xxxxx
-[ERROR] .bss [0x802xxxxx, 0x802xxxxx)
-[ INFO] load app0 to 0x802xxxxx
-Hello world from user mode program!
+```text
+[ INFO] GPU initialized, framebuffer ready
+[ INFO] load app0 to 0x84000000
+Hello, world from user mode program!
 [ INFO] app0 exit with code 0
-
-[ INFO] load app1 to 0x802xxxxx
-...（更多用户程序输出）...
+...
+[ INFO] load app8 to 0x84000000
+[tangram] request draw piece: 0
+[ INFO] [Syscall] request draw piece: 0
+[ INFO] gpu.flush() success — pieces shown: 1
+...
+[ INFO] load app20 to 0x84000000
+[tangram] request draw piece: 12
+[ INFO] [Syscall] request draw piece: 12
+[ INFO] gpu.flush() success — pieces shown: 13
+[ INFO] All apps finished. Tangram OS rendered.
 ```
 
 批处理系统依次加载并运行每个用户程序：
 - 正常的用户程序会打印输出，然后通过 `exit` 系统调用退出
 - 出错的用户程序（如非法指令、访存错误）会被内核杀死，然后继续运行下一个
+- 扩展后的 tangram 用户程序会先通过 `write(fd = 100, &[piece_id])` 请求内核绘制一块，再正常退出
+
+### 2.3.1 这次扩展是怎么接进去的
+
+本次 `T3L2` 没有新增一套独立 syscall，而是直接复用了现有的 `write` 路径：
+
+1. `tg-rcore-tutorial-user/src/bin/tangram_00.rs` 到 `tangram_12.rs` 各自代表一块七巧板
+2. 每个用户程序执行 `write(100, &[piece_id])`
+3. 内核在 `impls::SyscallContext::write()` 中识别 `fd == 100`
+4. 内核调用 `tangram_draw(piece_id)`
+5. `tangram_draw()` 把 `piece_id` 转成 `(o_count, s_count)`，再调用 `render_progressive()`
+6. `gpu::flush()` 把新的 framebuffer 内容显示到 QEMU 窗口
+
+这样做的好处是：原有 `write/exit` 教学主线不变，基础测试继续通过，同时又把“一个程序对应一块”的动态效果嵌进了原本的批处理框架。
 
 ### 2.4 检查tg-ch2内核是否通过基础测试
 
@@ -359,6 +388,13 @@ RISC-V 定义了三个特权级，本章重点关注 U-mode 和 S-mode 之间的
 | 64 | `write` | 将缓冲区数据写入文件描述符（fd=1 为标准输出） |
 | 93 | `exit` | 退出当前用户程序 |
 
+这次扩展额外约定了一个“特殊 fd 协议”：
+
+| fd | 语义 | 实现位置 |
+|----|------|----------|
+| `1` / `2` | 标准输出 / 调试输出 | `impls::SyscallContext::write()` |
+| `100` | 七巧板绘制请求，缓冲区首字节为 `piece_id` | `impls::SyscallContext::write()` → `tangram_draw()` |
+
 用户程序中的系统调用过程（以 `write` 为例）：
 
 ```
@@ -392,6 +428,12 @@ Trap 进入内核 → handle_syscall
 3. 使用 `rust-objcopy` 将 ELF 转为纯二进制格式（.bin）
 4. 生成汇编文件 `app.asm`，用 `.incbin` 指令将所有 .bin 文件嵌入到内核的 `.data` 段
 
+当前本地 `tg-rcore-tutorial-user/cases.toml` 中，`[ch2]` 保留了原有基础测试程序，并在其后追加了 `tangram_00` 到 `tangram_12` 共 13 个用户程序。因此：
+
+- 原有 ch2 教学逻辑和 `./test.sh` 仍然保持向前兼容
+- 七巧板动画则作为“附加批处理任务”自动接在原测试程序之后执行
+- `base` 被调整为 `0x8400_0000`，避免内核中的 GPU DMA pool / 堆 / BSS 区域覆盖用户程序
+
 运行时，内核通过 `tg_linker::AppMeta::locate()` 获取用户程序的元数据（数量、位置、大小），然后依次加载到内存中执行。
 
 ---
@@ -405,27 +447,36 @@ Trap 进入内核 → handle_syscall
 **模块文档与属性（第 1-21 行）：**
 与第一章相同的 `#![no_std]`、`#![no_main]` 和条件编译属性。
 
-**外部依赖引入（第 23-38 行）：**
+**外部依赖引入（文件前部）：**
 - `tg_console`：`print!` / `println!` 宏和日志功能
 - `riscv::register::*`：访问 CSR 寄存器（如 `scause`）
 - `tg_kernel_context::LocalContext`：用户上下文管理
 - `tg_syscall`：系统调用分发框架
+- `tg_kernel_alloc`：为 VirtIO-GPU 队列和 framebuffer 相关对象提供堆
+- `mod gpu; mod tangram;`：接入图形渲染模块
 
-**启动与数据嵌入（第 42-47 行）：**
+**启动与数据嵌入（启动部分）：**
 - `global_asm!(include_str!(env!("APP_ASM")))`：将用户程序二进制数据嵌入内核
-- `tg_linker::boot0!(rust_main; stack = 8 * 4096)`：定义入口，分配 32 KiB 内核栈
+- `HEAP_SPACE`：给 `tg-kernel-alloc` 提供 2 MiB 堆空间
+- 自定义 `_start`：定义入口并分配 32 KiB 内核栈
 
-**内核主函数 `rust_main`（第 51-107 行）：**
-核心的批处理循环：初始化 → 遍历用户程序 → 创建上下文 → execute → 处理 Trap → 下一个
+**内核主函数 `rust_main`（主体逻辑）：**
+核心流程变成：清零 BSS → 初始化控制台 → 初始化堆 → 初始化 GPU → 初始化 syscall 框架 → 批处理执行所有 app → 关机
 
 **系统调用处理 `handle_syscall`（第 121-142 行）：**
 从上下文提取 syscall ID 和参数，分发到 `tg_syscall::handle`，将返回值写回 `a0`
 
-**接口实现模块 `impls`（第 146-194 行）：**
+**接口实现模块 `impls`（文件后半部分）：**
 - `Console`：通过 SBI 实现字符输出
-- `SyscallContext`：实现 `write` 和 `exit` 系统调用
+- `SyscallContext`：实现 `write` 和 `exit` 系统调用，其中 `write(fd=100, ...)` 被复用于 tangram 绘制请求
 
-### 4.2 `build.rs` —— 构建脚本
+### 4.2 `src/gpu.rs` / `src/tangram.rs` —— 图形扩展
+
+- `src/gpu.rs`：初始化 VirtIO-GPU，持久化 framebuffer 指针，并在每次用户程序请求绘图后执行 `flush()`
+- `src/tangram.rs`：复用 ch1 的 `O_PIECES` / `S_PIECES` 与栅格化逻辑，通过 `render_progressive()` 支持前缀重绘
+- `tangram_draw(piece_id)`：把“第几块”翻译成“当前应显示多少块 `O`、多少块 `S`”
+
+### 4.3 `build.rs` —— 构建脚本
 
 这是本章最复杂的文件，负责在编译期完成用户程序的获取、编译和打包。关键函数：
 
@@ -439,7 +490,7 @@ Trap 进入内核 → handle_syscall
 | `write_app_asm()` | 生成汇编文件，嵌入用户程序二进制 |
 | `write_dummy_app_asm()` | 生成空的占位汇编（用于 publish --dry-run） |
 
-### 4.3 `Cargo.toml` —— 依赖说明
+### 4.4 `Cargo.toml` —— 依赖说明
 
 | 依赖 | 说明 |
 |------|------|
@@ -448,7 +499,9 @@ Trap 进入内核 → handle_syscall
 | `tg-rcore-tutorial-linker` | 链接脚本生成、内核布局定位、用户程序元数据 |
 | `tg-rcore-tutorial-console` | 控制台输出（`print!` / `println!`）和日志 |
 | `tg-rcore-tutorial-kernel-context` | 用户上下文 `LocalContext`，实现特权级切换 |
+| `tg-rcore-tutorial-kernel-alloc` | no_std 堆分配器，支撑 VirtIO-GPU 队列与 DMA 相关对象 |
 | `tg-rcore-tutorial-syscall` | 系统调用定义与分发框架 |
+| `virtio-drivers` | VirtIO-GPU 驱动支持 |
 
 ---
 
@@ -461,6 +514,7 @@ Trap 进入内核 → handle_syscall
 3. **理解了 Trap 处理流程**：从 `ecall` 触发到硬件自动保存 CSR，再到软件保存/恢复上下文
 4. **实现了系统调用**：`write` 和 `exit` 是用户程序与内核交互的最基本接口
 5. **了解了用户程序的打包**：在编译期将用户程序嵌入内核镜像
+6. **完成了图形化扩展**：在不破坏原有 ch2 基础测试的前提下，把 VirtIO-GPU 和逐块七巧板动画接入批处理框架
 
 在后续章节中，我们将从批处理系统演进为**多道程序系统**和**分时共享系统**，实现多任务切换和时间片调度。
 
@@ -489,8 +543,8 @@ Trap 进入内核 → handle_syscall
 
 | 操作系统内核 | 所涉及核心知识点 | 主要完成功能 | 所依赖的组件 |
 |:-----|:------------|:---------|:---------------|
-| **tg-rcore-tutorial-ch1** | 应用程序执行环境<br>裸机编程（Bare-metal）<br>SBI（Supervisor Binary Interface）<br>RISC-V 特权级（M/S-mode）<br>链接脚本（Linker Script）<br>内存布局（Memory Layout）<br>Panic 处理 | 最小 S-mode 裸机程序<br>QEMU 直接启动（无 OpenSBI）<br>打印 "Hello, world!" 并关机<br>演示最基本的 OS 执行环境 | tg-rcore-tutorial-sbi |
-| **tg-rcore-tutorial-ch2** | 批处理系统（Batch Processing）<br>特权级切换（U-mode ↔ S-mode）<br>Trap 处理（ecall / 异常）<br>上下文保存与恢复<br>系统调用（write / exit）<br>用户态 / 内核态<br>`sret` 返回指令 | 批处理操作系统<br>顺序加载运行多个用户程序<br>特权级切换和 Trap 处理框架<br>实现 write / exit 系统调用 | tg-rcore-tutorial-sbi<br>tg-rcore-tutorial-linker<br>tg-rcore-tutorial-console<br>tg-rcore-tutorial-kernel-context<br>tg-rcore-tutorial-syscall |
+| **tg-rcore-tutorial-ch1** | 应用程序执行环境<br>裸机编程（Bare-metal）<br>SBI（Supervisor Binary Interface）<br>RISC-V 特权级（M/S-mode）<br>链接脚本（Linker Script）<br>内存布局（Memory Layout）<br>Panic 处理<br>VirtIO-GPU / framebuffer | 最小 S-mode 裸机程序<br>QEMU 直接启动（无 OpenSBI）<br>初始化 VirtIO-GPU 并显示静态七巧板 `OS` 图案<br>演示最基本的 OS 执行环境与图形输出链路 | tg-rcore-tutorial-sbi |
+| **tg-rcore-tutorial-ch2** | 批处理系统（Batch Processing）<br>特权级切换（U-mode ↔ S-mode）<br>Trap 处理（ecall / 异常）<br>上下文保存与恢复<br>系统调用（write / exit）<br>用户态 / 内核态<br>`sret` 返回指令<br>VirtIO-GPU / framebuffer | 批处理操作系统<br>顺序加载运行多个用户程序<br>特权级切换和 Trap 处理框架<br>复用 `write` 路径实现逐块七巧板 `OS` 动画<br>保持基础测试向前兼容 | tg-rcore-tutorial-sbi<br>tg-rcore-tutorial-linker<br>tg-rcore-tutorial-console<br>tg-rcore-tutorial-kernel-context<br>tg-rcore-tutorial-kernel-alloc<br>tg-rcore-tutorial-syscall<br>virtio-drivers |
 | **tg-rcore-tutorial-ch3** | 多道程序（Multiprogramming）<br>任务控制块（TCB）<br>协作式调度（yield）<br>抢占式调度（Preemptive）<br>时钟中断（Clock Interrupt）<br>时间片轮转（Time Slice）<br>任务切换（Task Switch）<br>任务状态（Ready/Running/Finished）<br>clock_gettime 系统调用 | 多道程序与分时多任务<br>多程序同时驻留内存<br>协作式 + 抢占式调度<br>时钟中断与时间管理 | tg-rcore-tutorial-sbi<br>tg-rcore-tutorial-linker<br>tg-rcore-tutorial-console<br>tg-rcore-tutorial-kernel-context<br>tg-rcore-tutorial-syscall |
 | **tg-rcore-tutorial-ch4** | 虚拟内存（Virtual Memory）<br>Sv39 三级页表（Page Table）<br>地址空间隔离（Address Space）<br>页表项（PTE）与标志位<br>地址转换（VA → PA）<br>异界传送门（MultislotPortal）<br>ELF 加载与解析<br>堆管理（sbrk）<br>恒等映射（Identity Mapping）<br>内存保护（Memory Protection）<br>satp CSR | 引入 Sv39 虚拟内存<br>每个用户进程独立地址空间<br>跨地址空间上下文切换<br>进程隔离和内存保护 | tg-rcore-tutorial-sbi<br>tg-rcore-tutorial-linker<br>tg-rcore-tutorial-console<br>tg-rcore-tutorial-kernel-context<br>tg-rcore-tutorial-kernel-alloc<br>tg-rcore-tutorial-kernel-vm<br>tg-rcore-tutorial-syscall |
 | **tg-rcore-tutorial-ch5** | 进程（Process）<br>进程控制块（PCB）<br>进程标识符（PID）<br>fork（地址空间深拷贝）<br>exec（程序替换）<br>waitpid（等待子进程）<br>进程树 / 父子关系<br>初始进程（initproc）<br>Shell 交互式命令行<br>进程生命周期（Ready/Running/Zombie）<br>步幅调度（Stride Scheduling） | 引入进程管理<br>fork / exec / waitpid 系统调用<br>动态创建、替换、等待进程<br>Shell 交互式命令行 | tg-rcore-tutorial-sbi<br>tg-rcore-tutorial-linker<br>tg-rcore-tutorial-console<br>tg-rcore-tutorial-kernel-context<br>tg-rcore-tutorial-kernel-alloc<br>tg-rcore-tutorial-kernel-vm<br>tg-rcore-tutorial-syscall<br>tg-rcore-tutorial-task-manage |

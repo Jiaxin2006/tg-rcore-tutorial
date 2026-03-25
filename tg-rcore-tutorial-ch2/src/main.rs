@@ -43,7 +43,20 @@ use tg_sbi;
 // 系统调用相关：调用者信息、系统调用 ID
 use tg_syscall::{Caller, SyscallId};
 
+#[cfg(target_arch = "riscv64")]
+use tg_kernel_alloc::{init as alloc_init, transfer as alloc_transfer};
+
+#[cfg(target_arch = "riscv64")]
+mod gpu;
+#[cfg(target_arch = "riscv64")]
+mod tangram;
+
 // ========== 启动相关 ==========
+
+// 堆空间：供 virtio-drivers 等需要 alloc 的依赖使用
+#[cfg(target_arch = "riscv64")]
+#[unsafe(link_section = ".bss.uninit")]
+static mut HEAP_SPACE: [u8; 2 * 1024 * 1024] = [0; 2 * 1024 * 1024];
 
 // 将用户程序的二进制数据内联到内核镜像的 .data 段中
 // APP_ASM 由 build.rs 在编译时生成，包含所有用户程序的二进制数据
@@ -84,11 +97,28 @@ extern "C" fn rust_main() -> ! {
     tg_console::set_log_level(option_env!("LOG"));
     tg_console::test_log();
 
-    // 第三步：初始化系统调用处理（注册 IO 和 Process 的实现）
+    // 第三步：初始化堆分配器（virtio-drivers 需要 alloc）
+    let heap_ptr = core::ptr::addr_of_mut!(HEAP_SPACE) as *mut u8;
+    alloc_init(heap_ptr as usize);
+    unsafe {
+        alloc_transfer(core::slice::from_raw_parts_mut(heap_ptr, 2 * 1024 * 1024));
+    }
+
+    // 第四步：初始化 VirtIO-GPU 并清屏
+    gpu::init();
+    gpu::with_framebuffer(|fb, _w, _h| {
+        for px in fb.iter_mut() {
+            *px = 0xFFFF_FFFF; // white
+        }
+    });
+    gpu::flush();
+    log::info!("GPU initialized, framebuffer ready");
+
+    // 第五步：初始化系统调用处理（注册 IO 和 Process 的实现）
     tg_syscall::init_io(&SyscallContext);
     tg_syscall::init_process(&SyscallContext);
 
-    // 第四步：批处理——依次加载并运行每个用户程序
+    // 第六步：批处理——依次加载并运行每个用户程序
     for (i, app) in tg_linker::AppMeta::locate().iter().enumerate() {
         let app_base = app.as_ptr() as usize;
         log::info!("load app{i} to {app_base:#x}");
@@ -140,7 +170,8 @@ extern "C" fn rust_main() -> ! {
         println!();
     }
 
-    // 所有用户程序执行完毕，关机
+    // 所有用户程序执行完毕
+    log::info!("All apps finished. Tangram OS rendered.");
     tg_sbi::shutdown(false)
 }
 
@@ -194,6 +225,21 @@ fn handle_syscall(ctx: &mut LocalContext) -> SyscallResult {
 
 // ========== 接口实现 ==========
 
+/// 七巧板绘制的特殊文件描述符，用户程序通过 write(DRAW_FD, &[piece_id]) 触发绘制
+const DRAW_FD: usize = 100;
+
+/// 根据 piece_id 做 progressive 渲染：把前 piece_id+1 块全部重绘并刷新。
+fn tangram_draw(piece_id: usize) {
+    let total = piece_id + 1;
+    let o_count = total.min(tangram::O_PIECES.len());
+    let s_count = total.saturating_sub(tangram::O_PIECES.len());
+    gpu::with_framebuffer(|fb, w, h| {
+        tangram::render_progressive(fb, w, h, o_count, s_count);
+    });
+    gpu::flush();
+    log::info!("gpu.flush() success — pieces shown: {total}");
+}
+
 /// 各依赖库所需接口的具体实现
 mod impls {
     use tg_syscall::{STDDEBUG, STDOUT};
@@ -229,6 +275,15 @@ mod impls {
                             count,
                         ))
                     });
+                    count as _
+                }
+                // 七巧板绘制请求：buf[0] = piece_id
+                super::DRAW_FD => {
+                    if count > 0 {
+                        let piece_id = unsafe { *(buf as *const u8) } as usize;
+                        tg_console::log::info!("[Syscall] request draw piece: {piece_id}");
+                        super::tangram_draw(piece_id);
+                    }
                     count as _
                 }
                 _ => {

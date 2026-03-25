@@ -1123,4 +1123,190 @@ A: 目标与边界
 
 Q: 直接复用 `o_pieces()s_pieces()render_piece()render_progressive()` 帮我实现：在ch2基础上扩展内核功能，动态分步显示七巧板“OS”图案，即通过多程序批处理方式，每个程序渲染一块，逐块渲染七巧板“OS”的 n 个组成部分，实现动态拼接的视觉效果。告诉我接口需要怎么接
 
-A: 
+A: 这几个接口**不能直接接到用户程序里**，因为它们现在是 `ch1` 内核里的 Rust 函数`ch2` 的用户程序只能通过 `ecall/syscall` 或者“内核按批处理进度主动调用”间接触达。
+
+我建议你在 `ch2` 里用**最小改动方案**接，最合适：
+
+## 推荐接法
+
+把 `o_pieces()` / `s_pieces()` / `render_progressive()` 当成**内核私有渲染接口**，在 `ch2` 的批处理主循环里，**每跑完一个用户程序，就让内核多显示一块**。
+
+当前 `ch2` 的批处理入口就在这里：
+
+```77:145:tg-rcore-tutorial-ch2/src/[main.rs](http://main.rs)
+
+extern "C" fn rust_main() -> ! {
+
+    // ...
+
+    for (i, app) in tg_linker::AppMeta::locate().iter().enumerate() {
+
+        let app_base = [app.as](http://app.as)_ptr() as usize;
+
+        // ...
+
+        loop {
+
+            unsafe { ctx.execute() };
+
+            match scause::read().cause() {
+
+                Trap::Exception(Exception::UserEnvCall) => {
+
+                    match handle_syscall(&mut ctx) {
+
+                        Done => continue,
+
+                        Exit(code) => log::info!("app{i} exit with code {code}"),
+
+                        Error(id) => {
+
+                            log::error!("app{i} call an unsupported syscall {}", id.0)
+
+                        }
+
+                    }
+
+                }
+
+                trap => log::error!("app{i} was killed because of {trap:?}"),
+
+            }
+
+            unsafe { core::arch::asm!("fence.i") };
+
+            break;
+
+        }
+
+        println!();
+
+    }
+
+    tg_sbi::shutdown(false)
+
+}
+
+```
+
+而你已经准备好的渲染接口是这些：
+
+```165:232:tg-rcore-tutorial-ch1/src/[tangram.rs](http://tangram.rs)
+
+pub(crate) fn o_pieces() -> &'static [Piece] { /* ... */ }
+
+pub(crate) fn s_pieces() -> &'static [Piece] { /* ... */ }
+
+pub(crate) fn render_piece(framebuffer: &mut [u32], width: usize, height: usize, piece: &Piece) {
+
+    // ...
+
+}
+
+pub(crate) fn render_progressive(
+
+    framebuffer: &mut [u32],
+
+    width: usize,
+
+    height: usize,
+
+    o_count: usize,
+
+    s_count: usize,
+
+) {
+
+    clear(framebuffer, WHITE);
+
+    render_pieces(framebuffer, width, height, &O_PIECES[..o_count.min(O_PIECES.len())]);
+
+    render_pieces(framebuffer, width, height, &S_PIECES[..s_count.min(S_PIECES.len())]);
+
+}
+
+```
+
+## 具体怎么接
+
+1. 把 `ch1` 的 `gpu.rs` 和 `tangram.rs` 拷到 `ch2`。
+
+2. 给 `ch2` 加上 `tg-kernel-allocvirtio-drivers` 依赖，并加 `HEAP_SPACE`。
+
+3. 在 `rust_main()` 批处理循环开始前初始化：
+
+   - allocator
+
+   - `let mut gpu = gpu::Gpu::new()?`
+
+4. 每当一个 app 退出或被杀死后，更新“当前已经完成的 piece 数”：
+
+   - `done = i + 1`
+
+   - `o_len = tangram::o_pieces().len()`
+
+   - `s_len = tangram::s_pieces().len()`
+
+5. 然后调用：
+
+```rust
+
+let done = i + 1;
+
+let o_len = tangram::o_pieces().len();
+
+let s_len = tangram::s_pieces().len();
+
+let o_count = done.min(o_len);
+
+let s_count = done.saturating_sub(o_len).min(s_len);
+
+gpu.render_once(|fb, width, height| {
+
+    tangram::render_progressive(fb, width, height, o_count, s_count);
+
+})?;
+
+```
+
+这样效果就是：
+
+- `app0` 跑完，显示第 1 块
+
+- `app1` 跑完，显示前 2 块
+
+- ...
+
+- `app12` 跑完，显示完整 `OS`
+
+## 为什么推荐这个方案
+
+- 不需要新增 syscall
+
+- 用户程序完全不用知道 GPU 和 framebuffer
+
+- 完全复用你已有的 `render_progressive()`
+
+- 最符合 `ch2`“批处理系统按 app 顺序推进状态”的主线
+
+## 用户程序侧怎么处理
+
+最简单就是准备 **13 个很小的用户程序**，每个程序只做两件事：
+
+- 打印一句 `"render step k"`
+
+- `exit(0)`
+
+`build.rs` 已经会按 `cases.toml` 里的顺序把它们打包，所以**顺序就是动画顺序**。
+
+## 如果你坚持“每个程序主动调用 render”
+
+那就再加一个自定义 syscall，例如：
+
+- `SYSCALL_TANGRAM_STEP(global_idx)`，或
+
+- `SYSCALL_TANGRAM_PROGRESS(o_count, s_count)`
+
+然后在 `handle_syscall()` 里先拦截这个 syscall，再调用 `render_piece()` 或 `render_progressive()`。但这比“批处理循环里直接推进一帧”更复杂，我不建议先这么做。
+
+如果你要，我下一步可以直接按这个推荐方案把 `ch2` 的代码接出来。
