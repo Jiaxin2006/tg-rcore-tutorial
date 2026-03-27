@@ -2,6 +2,36 @@ use crate::{ClockId, SignalAction, SignalNo, Stat, SyscallId, TimeSpec};
 use bitflags::*;
 use native::*;
 
+/// VirtIO-GPU 帧缓冲信息（与内核 `fb_get_info` 写入布局一致）。
+#[repr(C)]
+#[derive(Clone, Copy, Debug, Default)]
+pub struct FbInfo {
+    /// 水平像素
+    pub width: u32,
+    /// 垂直像素
+    pub height: u32,
+    /// 每行字节数（通常 = width * 4）
+    pub stride: u32,
+}
+
+/// 查询显示分辨率与 stride。
+#[inline]
+pub fn fb_get_info(info: *mut FbInfo) -> isize {
+    unsafe { syscall1(SyscallId::FB_GET_INFO, info as usize) }
+}
+
+/// 将 `DOOMGENERIC_RESX * DOOMGENERIC_RESY * 4` 字节的 RGBA 像素提交到扫描输出。
+#[inline]
+pub fn fb_present(buf: *const u8, len: usize) -> isize {
+    unsafe { syscall2(SyscallId::FB_PRESENT, buf as usize, len) }
+}
+
+/// 非阻塞读取一个输入字节；若当前没有输入则返回负值。
+#[inline]
+pub fn input_getchar() -> isize {
+    unsafe { syscall0(SyscallId::INPUT_GETCHAR) }
+}
+
 // 教程阅读建议：
 // - 先看 `native::syscall*` 系列，理解 ecall 调用约定；
 // - 再看本文件的高级封装函数，理解用户态接口如何映射到 syscall 参数。
@@ -348,6 +378,9 @@ pub fn pipe(pipe_fd: &mut [usize]) -> isize {
 /// - 传递无效的指针或参数可能导致未定义行为
 #[cfg(target_arch = "riscv64")]
 pub mod native {
+    // Rust 2024：`unsafe fn` 体内对 `asm!` 需显式 `unsafe` 块；此处集中允许以保持 ecall 封装可读。
+    #![allow(unsafe_op_in_unsafe_fn)]
+
     use crate::SyscallId;
     use core::arch::asm;
 

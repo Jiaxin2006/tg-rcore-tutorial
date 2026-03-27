@@ -2,7 +2,7 @@
 
 1. 如何与AI交互
 
-我写代码的时候大部分时间使用 cursor 的 auto 模型，pormpt 中我倾向于按条列出我希望它做的事情，这样它会给自己列一个 todo list 并完成，比纯粹的 chat 更不容易漏点。同时，虽然 context length 没有超，但是模型也会遗忘，需要自己把需要模型注意的点强调出来。ch5 之后我发现 auto 比较笨，于是换成了 GPT-5.3 Codex。不过模型太聪明了也有缺点 —— 会丧失一些从它的错误中学习的机会。
+我写代码的时候大部分时间使用 cursor 的 auto 模型，prompt 中我倾向于按条列出我希望它做的事情，这样它会给自己列一个 todo list 并完成，比纯粹的 chat 更不容易漏点。同时，虽然 context length 没有超，但是模型也会遗忘，需要自己把需要模型注意的点强调出来。ch5 之后我发现 auto 比较笨，于是换成了 GPT-5.3 Codex。不过模型太聪明了也有缺点 —— 会丧失一些从它的错误中学习的机会。
 
 cursor 相比部分 coding 工具的一个好处是它会展示出修改了哪些部分并可以回退。因此在赶时间的时候能够清晰地看出任务的主干代码是什么；有时间的时候也可以把修改部分删掉，重写一遍函数功能，并和 ai 的实现做对应，以此练习自己对操作系统架构和rust语法的掌握。在完成之后，我还会请 ai 给我针对这次实验提几个问题，以检查自己知识层面的理解。
 
@@ -315,3 +315,84 @@ T3L2: 真正棘手的问题反而出在内存布局上。最初 tangram 用户�
 | **工程挑战** | 上下文切换和 Trap 处理 | 上下文切换 + Trap + 图形设备 + 内存布局冲突 |
 
 总结来看，原教程更适合讲清 ch2 的“批处理系统骨架”；而 T3L2 则在不推翻这套骨架的前提下，把它扩展成了一个能产生可视化结果的教学实验。相比单纯看到程序依次打印字符串，这种“一个 app 对应一块拼图”的结果更容易让我把批处理、syscall、设备驱动和用户程序之间的关系串起来。
+
+## 六、T3L5 Doom 移植调试记录
+
+这部分记录我在把 `doomgeneric` 移植到 ch8 内核过程中，已经确认过的 bug、现象和修复过程，按排查顺序整理如下。
+
+### 1. 已定位并修复的问题
+
+1. `I_PrintBanner()` 一进入就卡死  
+根因不是 Doom 本身，而是我在 `rcore_libc.c` 里把 `memcpy/memset/memmove/memcmp/strlen/strcpy/strncpy/strcmp/strncmp` 这类函数直接写成了 `__builtin_*` 包装。对当前交叉编译器来说，这会被优化成“函数调用自己”，最后在反汇编里表现为 `j strlen` 这种无限自跳。修复方法是把这些函数全部改成手写循环实现。
+
+2. 资源加载过程中随机出现 `W_CacheLumpNum >= numlumps`，随后又出现 `W_Read()` 的 `LoadPageFault`  
+根因是我第一次手写的 `strncpy()` 有 off-by-one：当源串提前结束时，会额外多写一个字节。`lumpinfo_t` 的布局是 `name[8]` 后面紧跟 `wad_file` 指针，因此这个 bug 会直接踩坏 WAD 目录项里的文件指针，导致前面看起来像“随机 lump 越界”，后面则在 `wad->file_class->Read(...)` 处因为坏指针触发页故障。修复后，`R_Init` 能稳定跑完整个资源初始化阶段。
+
+3. `HU_Init` 报 `W_GetNumForName: STCFN33 not found!`  
+WAD 里实际存在的是 `STCFN033`。真正的问题是我自己实现的 `snprintf` 只支持宽度，不支持整数精度，所以 `DEH_snprintf(buffer, 9, "STCFN%.3d", j++)` 被错误格式化成了 `STCFN33`。修复方式是在 `do_printf()` 中补上对 `%.[0-9]+d/u/x` 的零填充精度支持。
+
+4. 图形初始化成功后，Doom 进程立刻正常退出  
+这不是崩溃，而是平台层逻辑漏写：`doomgeneric_rcore.c` 的 `main()` 只调用了 `doomgeneric_Create()`，没有像 SDL 后端那样进入 `doomgeneric_Tick()` 主循环。补上无限循环后，进程会保持常驻，图形后端也会持续刷新。
+
+### 2. 排查过程中保留的关键记录
+
+1. 一开始从 shell 输入 `doomgeneric` 后看起来“马上没反应”，我先怀疑 ELF 装载失败，于是在内核 `exec` 路径和 `from_elf` 中加日志，确认 Doom ELF 的 1.9MB 文件内容和约 8.7MB 的虚拟内存映射都已成功建立。
+
+2. 为了判断是否真的进入了用户态 `main()`，我在 `doomgeneric_rcore.c` 里加了一个直接走 `SYS_write` 的 `early_puts()`，并验证了串口输出与 `printf` 都可用，从而把问题范围缩小到 Doom 初始化流程内部。
+
+3. 之后通过在 `doomgeneric_Create()` 和 `D_DoomMain()` 中逐段打点，确认最早的卡点在 `I_PrintBanner()`；再通过反汇编发现 `strlen` 等基础 libc 符号被编译成了无限自跳，最终定位到 `__builtin_*` 这一层。
+
+4. 修完基础字符串/内存函数以后，Doom 已经能继续走到 `R_Init`、`HU_Init`、`ST_Init` 和 `I_InitGraphics`。目前 framebuffer 初始化成功，320x200 的 Doom 画面已经能被映射到 640x400 的 VirtIO-GPU 输出上。
+
+### 3. 当前状态
+
+- Doom 已经可以完成 WAD 加载、渲染资源初始化、HUD/状态栏初始化和 framebuffer 初始化。
+- 用户态进程不再因为基础 libc bug 崩溃，也不会在初始化完成后立刻退出。
+- 已补上一个非阻塞 `input_getchar` syscall，`DG_GetKey()` 也已经接入终端输入，支持方向键转义序列以及一组终端友好的按键映射（如 `WASD` 移动、`J` 开火、`K` 交互）。
+- framebuffer 提交路径从“左上角贴 640x400”改成了按整数倍居中缩放；在当前 QEMU 的 `1280x800` 显示模式下，会自动做 `2x` 放大，从而铺满整个窗口。
+- 当前阶段已经从“只能启动”推进到“可以持续运行 + 有基础键盘控制 + 显示满屏”。后续如果还要继续完善，主要工作会集中在输入体验细化（例如更完整的按键映射和更真实的 press/release 语义）。
+
+### 4. 2026-03-28 黑屏问题复盘（新增）
+
+1. 现象  
+`doomgeneric` 进程在 shell 中可启动，键盘输入有响应，但 QEMU 图形窗口持续黑屏。
+
+2. 根因（本次新增定位）  
+`ch8` 内核里的 `fb_present` 之前只对用户缓冲首地址做了一次 `address_space.translate`，随后直接按 `640*400*4` 连续读内存。这个做法默认“用户虚拟地址对应的物理页是连续的”，在实际分页场景下不成立，导致跨页后读到错误数据（常见结果就是整帧接近全黑）。
+
+3. 修复方案  
+在 `tg-rcore-tutorial-ch8/src/main.rs` 中新增按页拷贝逻辑：逐页 `translate` 用户缓冲并复制到内核 staging buffer，再把 staging buffer 提交给 `virtio_gpu::present`。这样不依赖物理页连续性，帧数据语义正确。
+
+4. 调试增强（便于后续排障）  
+- 内核 `fb_present` 新增错误日志：短缓冲、用户地址不可读、GPU 提交失败都会打印告警。
+- `doomgeneric_rcore.c` 新增 `fb_get_info` 启动日志与 `fb_present` 失败日志（限次打印），用于区分“内核帧缓冲未初始化”与“提交路径异常”。
+
+5. 关于“是否已接入原版游戏全部功能”的结论  
+目前**没有**做到“原版 Doom 的所有能力都完整接入内核”。当前已接入的是：
+- 文件 I/O（WAD 读取所需 open/read/lseek/fstat 路径）；
+- 基础时钟与调度让步（`clock_gettime` / `sched_yield`）；
+- 图形输出（`fb_present`）与串口键盘输入（`input_getchar` + 键位映射）。
+
+仍未完整接入/对齐原版体验的部分包括：
+- 鼠标输入（README 也明确说明未接）；
+- 真实音频输出链路（当前移植未提供设备级声音后端）；
+- 更完整的键盘按下/释放语义与高级输入设备支持（如手柄、多人网络相关能力）。
+
+### 5. 2026-03-28 Doom demo / 交互开关与黑屏进一步定位（新增）
+
+1. 启动模式开关  
+- `initproc` 的默认启动目标改成了 `doomgeneric`，因此 `cargo run` 时会默认直接进入 Doom，而不是先停在 shell。
+- `doomgeneric` 默认构建为**无交互 demo 模式**：`make -f Makefile.rcore` 会把参数固定为 `-iwad doom1.wad -playdemo demo1`，便于优先验证显示链路。
+- 若要测试键盘交互，可改用 `make -f Makefile.rcore DG_MODE=interactive` 重新编译 Doom，再执行 `cargo build` / `cargo run` 重新打包镜像。
+
+2. 这次进一步确认到的事实  
+- 在 `-display none` 的无窗口 QEMU 启动中，串口日志已经能稳定看到 `[doomgeneric] mode=demo (-playdemo demo1)`，说明 Doom 的自动 demo 模式确实已经生效。
+- 同时内核日志也能看到 `virtio-gpu: first present ... opaque_sample=1024/1024`，说明用户态第一帧已经成功提交到 VirtIO-GPU，且 alpha 不为 0，不是“应用根本没出图”。
+
+3. 新结论  
+如果本地 QEMU 图形窗口仍然是黑的，那么问题已经更偏向**宿主机 QEMU 图形后端显示**，而不是 guest 内核 / Doom 逻辑本身。也就是说，当前链路更像是：
+- guest 侧：已初始化 GPU、已进入 Doom、已提交非透明帧；
+- host 侧：窗口没有把扫描输出正确显示出来（例如 `cocoa` 后端兼容性/刷新行为问题）。
+
+4. 后续排查建议  
+优先尝试把 `tg-rcore-tutorial-ch8/.cargo/config.toml` 里的 `-display cocoa` 切换为 `-display sdl` 或 `-display gtk` 再验证；若切换后能看到 demo，则可以基本确认是 QEMU 图形后端问题，而不是内核 framebuffer 路径问题。

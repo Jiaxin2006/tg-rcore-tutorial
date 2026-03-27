@@ -42,6 +42,9 @@ pub trait IO: Sync {
     fn read(&self, caller: Caller, fd: usize, buf: usize, count: usize) -> isize {
         unimplemented!()
     }
+    fn input_getchar(&self, caller: Caller) -> isize {
+        unimplemented!()
+    }
     fn write(&self, caller: Caller, fd: usize, buf: usize, count: usize) -> isize {
         unimplemented!()
     }
@@ -69,6 +72,9 @@ pub trait IO: Sync {
         unimplemented!()
     }
     fn fstat(&self, caller: Caller, fd: usize, st: usize) -> isize {
+        unimplemented!()
+    }
+    fn lseek(&self, caller: Caller, fd: usize, offset: isize, whence: usize) -> isize {
         unimplemented!()
     }
 }
@@ -176,6 +182,16 @@ pub trait Trace: Sync {
     }
 }
 
+/// 帧缓冲：将用户态 RGBA 像素提交到 VirtIO-GPU 扫描输出。
+pub trait Framebuffer: Sync {
+    fn fb_get_info(&self, caller: Caller, info_ptr: usize) -> isize {
+        unimplemented!()
+    }
+    fn fb_present(&self, caller: Caller, buf: usize, len: usize) -> isize {
+        unimplemented!()
+    }
+}
+
 static PROCESS: Container<dyn Process> = Container::new();
 static IO: Container<dyn IO> = Container::new();
 static MEMORY: Container<dyn Memory> = Container::new();
@@ -185,6 +201,7 @@ static SIGNAL: Container<dyn Signal> = Container::new();
 static THREAD: Container<dyn Thread> = Container::new();
 static SYNC_MUTEX: Container<dyn SyncMutex> = Container::new();
 static TRACE: Container<dyn Trace> = Container::new();
+static FRAMEBUFFER: Container<dyn Framebuffer> = Container::new();
 
 #[inline]
 pub fn init_process(process: &'static dyn Process) {
@@ -231,6 +248,11 @@ pub fn init_trace(trace: &'static dyn Trace) {
     TRACE.init(trace);
 }
 
+#[inline]
+pub fn init_framebuffer(framebuffer: &'static dyn Framebuffer) {
+    FRAMEBUFFER.init(framebuffer);
+}
+
 pub enum SyscallResult {
     Done(isize),
     Unsupported(SyscallId),
@@ -259,6 +281,7 @@ pub fn handle(caller: Caller, id: SyscallId, args: [usize; 6]) -> SyscallResult 
             io.unlinkat(caller, args[0] as _, args[1], args[2] as _)
         }),
         Id::FSTAT => IO.call(id, |io| io.fstat(caller, args[0], args[1])),
+        Id::LSEEK => IO.call(id, |io| io.lseek(caller, args[0], args[1] as isize, args[2])),
         Id::EXIT => PROCESS.call(id, |proc| proc.exit(caller, args[0])),
         Id::CLONE => PROCESS.call(id, |proc| proc.fork(caller)),
         Id::EXECVE => PROCESS.call(id, |proc| proc.exec(caller, args[0], args[1])),
@@ -317,6 +340,13 @@ pub fn handle(caller: Caller, id: SyscallId, args: [usize; 6]) -> SyscallResult 
         Id::SETPRIORITY => SCHEDULING.call(id, |sched| sched.set_priority(caller, args[0] as _)),
         Id::BRK => PROCESS.call(id, |proc| proc.sbrk(caller, args[0] as _)),
         Id::PIPE2 => IO.call(id, |io| io.pipe(caller, args[0])),
+        Id::INPUT_GETCHAR => IO.call(id, |io| io.input_getchar(caller)),
+        Id::FB_GET_INFO => {
+            FRAMEBUFFER.call(id, |fb| fb.fb_get_info(caller, args[0]))
+        }
+        Id::FB_PRESENT => {
+            FRAMEBUFFER.call(id, |fb| fb.fb_present(caller, args[0], args[1]))
+        }
         _ => SyscallResult::Unsupported(id),
     }
 }

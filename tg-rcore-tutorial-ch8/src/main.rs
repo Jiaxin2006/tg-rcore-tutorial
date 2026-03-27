@@ -54,6 +54,21 @@ mod process;
 mod processor;
 /// VirtIO 块设备驱动
 mod virtio_block;
+/// VirtIO-GPU（仅 RISC-V 内核镜像编译）
+#[cfg(target_arch = "riscv64")]
+mod virtio_gpu;
+#[cfg(not(target_arch = "riscv64"))]
+mod virtio_gpu {
+    pub const DOOM_FB_W: usize = 640;
+    pub const DOOM_FB_H: usize = 400;
+    pub const DOOM_FB_BYTES: usize = DOOM_FB_W * DOOM_FB_H * 4;
+    #[inline]
+    pub fn init() -> Result<(), ()> { Err(()) }
+    #[inline]
+    pub fn dimensions() -> Option<(u32, u32, u32)> { None }
+    #[inline]
+    pub fn present(_: &[u8]) -> Result<(), ()> { Err(()) }
+}
 
 #[macro_use]
 extern crate tg_console;
@@ -126,8 +141,8 @@ unsafe extern "C" fn _start() -> ! {
     )
 }
 
-/// 物理内存容量 = 48 MiB
-const MEMORY: usize = 48 << 20;
+/// 内核可用物理内存 = 64 MiB（从 0x80200000 起，不可超过 QEMU -m 总量 - 2M SBI 区域）
+const MEMORY: usize = 64 << 20;
 /// 异界传送门所在虚页
 const PROTAL_TRANSIT: VPN<Sv39> = VPN::MAX;
 
@@ -157,8 +172,8 @@ impl KernelSpace {
 /// 内核地址空间全局实例
 static KERNEL_SPACE: KernelSpace = KernelSpace::new();
 
-/// VirtIO MMIO 设备地址范围
-pub const MMIO: &[(usize, usize)] = &[(0x1000_1000, 0x00_1000)];
+/// VirtIO-MMIO 区域（8 个 slot：块设备、GPU 等）
+pub const MMIO: &[(usize, usize)] = &[(0x1000_1000, 0x8000)];
 
 /// 内核主函数
 ///
@@ -200,6 +215,12 @@ extern "C" fn rust_main() -> ! {
     tg_syscall::init_signal(&SyscallContext);
     tg_syscall::init_thread(&SyscallContext);       // 本章新增：线程系统调用
     tg_syscall::init_sync_mutex(&SyscallContext);   // 本章新增：同步原语系统调用
+    // 步骤 7b：VirtIO-GPU 帧缓冲（可选，供 doomgeneric / fb_demo）
+    match crate::virtio_gpu::init() {
+        Ok(()) => log::info!("virtio-gpu: framebuffer initialized"),
+        Err(()) => log::warn!("virtio-gpu: unavailable (no GPU in this machine?)"),
+    }
+    tg_syscall::init_framebuffer(&SyscallContext);
     // 步骤 8：加载 initproc（返回 Process + Thread）
     let initproc = read_all(FS.open("initproc", OpenFlags::RDONLY).unwrap());
     if let Some((process, thread)) = Process::from_elf(ElfFile::new(initproc.as_slice()).unwrap()) {
@@ -266,7 +287,9 @@ extern "C" fn rust_main() -> ! {
                     }
                 }
                 e => {
-                    log::error!("unsupported trap: {e:?}");
+                    let sepc = riscv::register::sepc::read();
+                    let stval = riscv::register::stval::read();
+                    log::error!("unsupported trap: {e:?} sepc={sepc:#x} stval={stval:#x}");
                     unsafe { (*processor).make_current_exited(-3) };
                 }
             }
@@ -355,13 +378,13 @@ mod impls {
     use alloc::collections::BTreeMap;
     use alloc::sync::Arc;
     use alloc::{alloc::alloc_zeroed, string::String, vec::Vec};
-    use core::{alloc::Layout, ptr::NonNull};
+    use core::{alloc::Layout, cmp::min, ptr::NonNull};
     use spin::Mutex;
     use tg_console::log;
     use tg_easy_fs::{make_pipe, FSManager, OpenFlags, UserBuffer};
     use tg_kernel_vm::{
         page_table::{MmuMeta, Pte, VAddr, VmFlags, VmMeta, PPN, VPN},
-        PageManager,
+        AddressSpace, PageManager,
     };
     use tg_signal::SignalNo;
     use tg_sync::{Condvar, Mutex as MutexTrait, MutexBlocking, Semaphore};
@@ -431,6 +454,31 @@ mod impls {
     const READABLE: VmFlags<Sv39> = build_flags("RV");
     const WRITEABLE: VmFlags<Sv39> = build_flags("W_V");
     const DEADLOCK_RET: isize = -0xDEAD;
+    static FB_UPLOAD_BUF: Mutex<Vec<u8>> = Mutex::new(Vec::new());
+
+    fn copy_from_user(
+        address_space: &AddressSpace<Sv39, Sv39Manager>,
+        user_buf: usize,
+        dst: &mut [u8],
+    ) -> bool {
+        let page_size = 1usize << Sv39::PAGE_BITS;
+        let mut copied = 0usize;
+        while copied < dst.len() {
+            let Some(user_addr) = user_buf.checked_add(copied) else {
+                return false;
+            };
+            let offset = user_addr & (page_size - 1);
+            let chunk = min(page_size - offset, dst.len() - copied);
+            let Some(src) = address_space.translate::<u8>(VAddr::new(user_addr), READABLE) else {
+                return false;
+            };
+            unsafe {
+                core::ptr::copy_nonoverlapping(src.as_ptr(), dst.as_mut_ptr().add(copied), chunk);
+            }
+            copied += chunk;
+        }
+        true
+    }
 
     fn is_unsafe_state(available: &[usize], allocation: &[Vec<usize>], need: &[Vec<usize>]) -> bool {
         let n = allocation.len();
@@ -589,11 +637,23 @@ mod impls {
         is_unsafe_state(&available, &allocation, &need)
     }
 
-    /// IO 系统调用（与第七章基本相同）
+    /// IO 系统调用（与第七章基本相同，本章新增 lseek / fstat 支持 Doom 文件 I/O）
     ///
     /// 注意：本章通过 `get_current_proc()` 获取当前线程所属的进程，
     /// 而非直接 `current()`，因为 fd_table 属于进程而非线程。
     impl IO for SyscallContext {
+        fn input_getchar(&self, _caller: Caller) -> isize {
+            const UART_BASE: usize = 0x1000_0000;
+            const UART_RBR: usize = UART_BASE;
+            const UART_LSR: usize = UART_BASE + 5;
+            let lsr = unsafe { (UART_LSR as *const u8).read_volatile() };
+            if (lsr & 1) == 0 {
+                -1
+            } else {
+                unsafe { (UART_RBR as *const u8).read_volatile() as isize }
+            }
+        }
+
         fn write(&self, _caller: Caller, fd: usize, buf: usize, count: usize) -> isize {
             let current = PROCESSOR.get_mut().get_current_proc().unwrap();
             if let Some(ptr) = current.address_space.translate(VAddr::new(buf), READABLE) {
@@ -682,12 +742,43 @@ mod impls {
             current.fd_table.push(Some(Mutex::new(Fd::PipeWrite(write_end))));
             0
         }
+
+        fn lseek(&self, _caller: Caller, fd: usize, offset: isize, whence: usize) -> isize {
+            let current = PROCESSOR.get_mut().get_current_proc().unwrap();
+            if fd >= current.fd_table.len() || current.fd_table[fd].is_none() {
+                return -1;
+            }
+            current.fd_table[fd].as_ref().unwrap().lock().lseek(offset, whence)
+        }
+
+        fn fstat(&self, _caller: Caller, fd: usize, st: usize) -> isize {
+            let current = PROCESSOR.get_mut().get_current_proc().unwrap();
+            if fd >= current.fd_table.len() || current.fd_table[fd].is_none() {
+                return -1;
+            }
+            let file_size = current.fd_table[fd].as_ref().unwrap().lock().file_size();
+            let is_file = file_size > 0;
+            if let Some(mut ptr) = current.address_space
+                .translate::<Stat>(VAddr::new(st), WRITEABLE)
+            {
+                let stat = unsafe { ptr.as_mut() };
+                *stat = Stat::new();
+                if is_file {
+                    stat.mode = StatMode::FILE;
+                }
+                0
+            } else {
+                -1
+            }
+        }
     }
 
     /// 进程管理系统调用
     impl Process for SyscallContext {
         #[inline]
         fn exit(&self, _caller: Caller, exit_code: usize) -> isize { exit_code as isize }
+
+        fn sbrk(&self, _caller: Caller, _size: i32) -> isize { -1 }
 
         /// fork：创建子进程（返回 Process + Thread）
         fn fork(&self, _caller: Caller) -> isize {
@@ -721,7 +812,15 @@ mod impls {
                         println!();
                         -1
                     },
-                    |fd| { current.exec(ElfFile::new(&read_all(fd)).unwrap()); 0 },
+                    |fd| {
+                        let data = read_all(fd);
+                        log::info!("exec: read {} bytes", data.len());
+                        let elf = ElfFile::new(&data).unwrap();
+                        log::info!("exec: ELF parsed, entry={:#x}", elf.header.pt2.entry_point());
+                        current.exec(elf);
+                        log::info!("exec: address space replaced, resuming user");
+                        0
+                    },
                 )
         }
 
@@ -1023,6 +1122,52 @@ mod impls {
             let current_proc = PROCESSOR.get_mut().get_current_proc().unwrap();
             current_proc.deadlock_detect_enabled = is_enable == 1;
             0
+        }
+    }
+
+    /// 帧缓冲系统调用：查询分辨率、提交 doomgeneric 软件帧。
+    impl Framebuffer for SyscallContext {
+        fn fb_get_info(&self, _caller: Caller, info_ptr: usize) -> isize {
+            let Some((w, h, stride)) = crate::virtio_gpu::dimensions() else {
+                return -1;
+            };
+            let current = PROCESSOR.get_mut().get_current_proc().unwrap();
+            if let Some(mut ptr) = current.address_space.translate(VAddr::new(info_ptr), WRITEABLE) {
+                unsafe {
+                    let base = ptr.as_mut() as *mut u32;
+                    base.write_unaligned(w);
+                    base.add(1).write_unaligned(h);
+                    base.add(2).write_unaligned(stride);
+                }
+                0
+            } else {
+                -1
+            }
+        }
+
+        fn fb_present(&self, _caller: Caller, buf: usize, len: usize) -> isize {
+            let need = crate::virtio_gpu::DOOM_FB_BYTES;
+            if len < need {
+                log::warn!("fb_present: short user buffer, len={len}, need={need}");
+                return -1;
+            }
+            let current = PROCESSOR.get_mut().get_current_proc().unwrap();
+            let mut frame = FB_UPLOAD_BUF.lock();
+            if frame.len() < need {
+                frame.resize(need, 0);
+            }
+            let frame = &mut frame[..need];
+            if !copy_from_user(&current.address_space, buf, frame) {
+                log::warn!("fb_present: invalid user buffer addr={:#x} len={need}", buf);
+                return -1;
+            }
+            match crate::virtio_gpu::present(frame) {
+                Ok(()) => 0,
+                Err(()) => {
+                    log::warn!("fb_present: virtio-gpu present failed");
+                    -1
+                }
+            }
         }
     }
 }

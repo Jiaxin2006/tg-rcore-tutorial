@@ -192,6 +192,29 @@ fn easy_fs_pack(
         inode.write_at(0, all_data.as_slice());
     }
 
+    // 可选：若已用 `make -f Makefile.rcore` 生成 C 版 doomgeneric，一并打入镜像。
+    let ch8_root = PathBuf::from(env::var_os("CARGO_MANIFEST_DIR").unwrap());
+    let doom_dir = ch8_root.join("doomgeneric/doomgeneric");
+    let doom_elf = doom_dir.join("doomgeneric");
+    if doom_elf.is_file() {
+        println!("cargo:rerun-if-changed={}", doom_elf.display());
+        let mut host_file = std::fs::File::open(&doom_elf).unwrap();
+        let mut all_data: Vec<u8> = Vec::new();
+        host_file.read_to_end(&mut all_data).unwrap();
+        let inode = root_inode.create("doomgeneric").unwrap();
+        inode.write_at(0, all_data.as_slice());
+    }
+    // doom1.wad (shareware WAD，约 4 MB)
+    let wad_file = doom_dir.join("doom1.wad");
+    if wad_file.is_file() {
+        println!("cargo:rerun-if-changed={}", wad_file.display());
+        let mut host_file = std::fs::File::open(&wad_file).unwrap();
+        let mut all_data: Vec<u8> = Vec::new();
+        host_file.read_to_end(&mut all_data).unwrap();
+        let inode = root_inode.create("doom1.wad").unwrap();
+        inode.write_at(0, all_data.as_slice());
+    }
+
     Ok(())
 }
 

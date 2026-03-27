@@ -225,6 +225,69 @@ Shell: Process 2 exited with code 0
 ./test.sh all       # 等价于 ./test.sh
 ```
 
+### 2.6 Doom（doomgeneric）移植：构建、运行与操作
+
+本章可选实验在 QEMU **VirtIO-GPU** 窗口里运行 [doomgeneric](https://github.com/ozkl/doomgeneric) 的 rCore 移植。`.cargo/config.toml` 已配置 `-display cocoa`（macOS）或可自行改为 `sdl` / `gtk`，串口仍用 `mon:stdio`，因此 **键盘要输入到运行 `cargo run` 的那个终端**（QEMU 图形窗口只负责显示）。
+
+#### 准备资源
+
+1. **交叉编译器**：需要能生成 `riscv64` 裸机 ELF 的 GCC，例如 `riscv64-elf-gcc`。若可执行文件前缀不是 `riscv64-elf-`，在编译 Doom 时设置：
+   ```bash
+   export RISCV_PREFIX=riscv64-unknown-elf-   # 按本机工具链实际前缀修改
+   ```
+2. **IWAD**：将官方共享软件 **`doom1.wad`** 放到 `tg-rcore-tutorial-ch8/doomgeneric/doomgeneric/`（与 `Makefile.rcore` 同级）。`build.rs` 会把它和用户态 ELF `doomgeneric` 一起打进 `fs.img`。
+3. **编译 Doom 用户程序**：
+   ```bash
+   cd tg-rcore-tutorial-ch8/doomgeneric/doomgeneric
+   make -f Makefile.rcore
+   ```
+   生成同目录下的 `doomgeneric` 后，再在 ch8 根目录执行 `cargo build`（或 `cargo run`）以重新打包磁盘镜像。
+
+#### 运行
+
+```bash
+cd tg-rcore-tutorial-ch8
+cargo run
+```
+
+在 Shell 中执行 **`doomgeneric`**。游戏内部分辨率为 `640×400`，内核会按比例缩放并居中到 VirtIO-GPU 分辨率。
+
+#### 原版 Doom（本移植默认键位，见 `m_controls.c`）在做什么
+
+以下对应 Chocolate Doom / doomgeneric 里 **默认键盘绑定**（与经典 DOS 版习惯一致；具体可在游戏 Options 里改）：
+
+| 功能 | 默认键 |
+|------|--------|
+| 前进 / 后退 / 左转 / 右转 | **方向键** ↑ ↓ ← → |
+| 开火 | **Ctrl**（内部键码 `KEY_FIRE`） |
+| 使用（开门、按开关等） | **空格** |
+| 奔跑 | **右 Shift** |
+| 平移 | 按住 **右 Alt** 再配合方向键；或直接 **`,` / `.`** 左右平移 |
+| 自动地图 | **Tab** |
+| 菜单 / 暂停游戏菜单 | **Esc** |
+| 切换武器 | **1–7**（1 徒手、2 手枪等） |
+| 菜单快捷键 | **F1** 帮助，**F2/F3** 存/读档，**F4** 音量……（与原版一致） |
+
+鼠标在本端口未接；多人聊天等键仍按引擎默认（如 **T** 打开聊天），一般用不到。
+
+#### 本实验终端里的额外映射（`doomgeneric_rcore.c`）
+
+串口只能传字节，因此增加了与 **WASD / 单键** 等价的映射（焦点必须在 QEMU 串口终端）：
+
+| 终端按键 | 相当于 |
+|----------|--------|
+| **W A S D** | 上 / 左 / 下 / 右 |
+| **方向键**（发送 ANSI `Esc [ A` 等） | 同上 |
+| **J** | 开火 |
+| **K** | 使用 |
+| **U** | 奔跑（右 Shift） |
+| **I** | 平移修饰（右 Alt） |
+| **Q** | Esc |
+| **空格 / Tab / Enter** | 与原版一致 |
+| 可打印 ASCII（如 **1–7**） | 直接交给游戏（切枪等） |
+
+若画面曾全黑，多为 32 位帧缓冲 **未写入不透明 alpha**；本仓库在 `doomgeneric/doomgeneric/i_video.c` 的 `cmap_to_fb` 中已按 VirtIO-GPU 格式填满 alpha 通道。
+
 ---
 
 ## 三、操作系统核心概念

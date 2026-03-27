@@ -164,6 +164,11 @@ impl Process {
             let len_file = program.file_size() as usize;
             let off_mem = program.virtual_addr() as usize;
             let end_mem = off_mem + program.mem_size() as usize;
+            let pages = VAddr::<Sv39>::new(end_mem).ceil().val() - VAddr::<Sv39>::new(off_mem).floor().val();
+            tg_console::log::info!(
+                "from_elf: LOAD vaddr={:#x}..{:#x} filesz={:#x} memsz={:#x} pages={}",
+                off_mem, end_mem, len_file, end_mem - off_mem, pages
+            );
             assert_eq!(off_file & PAGE_MASK, off_mem & PAGE_MASK);
             let mut flags: [u8; 5] = *b"U___V";
             if program.flags().is_execute() { flags[1] = b'X'; }
@@ -175,6 +180,7 @@ impl Process {
                 off_mem & PAGE_MASK,
                 parse_flags(unsafe { core::str::from_utf8_unchecked(&flags) }).unwrap(),
             );
+            tg_console::log::info!("from_elf: segment mapped OK");
         }
         // 分配 2 页用户栈
         let stack = unsafe {

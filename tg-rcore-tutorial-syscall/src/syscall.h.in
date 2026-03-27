@@ -1,4 +1,4 @@
-﻿// Copied from <https://git.musl-libc.org/cgit/musl/tree/arch/riscv64/bits/syscall.h.in>.
+// Copied from <https://git.musl-libc.org/cgit/musl/tree/arch/riscv64/bits/syscall.h.in>.
 
 #define __NR_io_setup 0
 #define __NR_io_destroy 1
@@ -321,6 +321,10 @@
 #define __NR_trace 410
 #define __NR_enable_deadlock_detect 469
 
+// Framebuffer (VirtIO-GPU scanout，供 doomgeneric 等用户态软件渲染)
+#define __NR_fb_get_info 1040
+#define __NR_fb_present 1041
+#define __NR_input_getchar 1042
 
 // #define __NR_sysriscv __NR_arch_specific_syscall
 // #define __NR_riscv_flush_icache (__NR_sysriscv + 15)

@@ -28,3 +28,20 @@ Cargo.lock
 # bundle/submodules.tar.gz
 # Extracted workspace (optional - uncomment if you want to ignore extracted content)
 # workspace-full/
+
+# 通用构建产物和 IDE 文件
+*.o
+*.obj
+*.exe
+*.log
+*.user
+*~
+*.DS_Store
+.vs/
+Debug/
+Release/
+Build/
+
+# doomgeneric 子目录特定文件
+doomgeneric/doomgeneric
+doomgeneric/doomgeneric.map

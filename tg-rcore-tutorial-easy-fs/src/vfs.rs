@@ -149,6 +149,12 @@ impl Inode {
         self.inode_id
     }
 
+    /// 文件大小（字节）
+    pub fn size(&self) -> usize {
+        let _fs = self.fs.lock();
+        self.read_disk_inode(|disk_inode| disk_inode.size as usize)
+    }
+
     /// inode 是否是目录
     pub fn is_dir(&self) -> bool {
         self.read_disk_inode(|disk_inode| disk_inode.is_dir())

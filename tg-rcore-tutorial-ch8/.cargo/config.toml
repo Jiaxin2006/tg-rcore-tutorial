@@ -5,23 +5,35 @@ target = "riscv64gc-unknown-none-elf"
 # QEMU 运行配置
 # 使用 qemu-system-riscv64 运行编译产物
 # -machine virt        ：QEMU virt 虚拟机平台
-# -nographic           ：无图形界面，输出到终端
+# -nographic           ：无图形界面，输出到终端（GPU 仍可在内核中工作）
 # -bios none           ：不使用 BIOS（内核直接启动）
+# -m 128M              ：128 MiB 内存，为 GPU 帧缓冲和 Doom 提供足够空间
 # -drive ...           ：挂载 easy-fs 磁盘镜像（包含用户程序）
-# -device ...          ：VirtIO 块设备
+# -device virtio-blk   ：VirtIO 块设备（bus.0 = 0x10001000）
+# -device virtio-gpu   ：VirtIO GPU 设备（bus.1 = 0x10002000）
 # -kernel              ：内核 ELF 文件
+#
+# 若需查看 GPU 画面输出，可将 -nographic 替换为：
+#   -serial stdio -display sdl
 [target.riscv64gc-unknown-none-elf]
 runner = [
     "qemu-system-riscv64",
     "-machine",
     "virt",
-    "-nographic",
+    "-serial",
+    "mon:stdio",
+    "-display",
+    "cocoa",
     "-bios",
     "none",
+    "-m",
+    "128M",
     "-drive",
     "file=target/riscv64gc-unknown-none-elf/debug/fs.img,if=none,format=raw,id=x0",
     "-device",
     "virtio-blk-device,drive=x0,bus=virtio-mmio-bus.0",
+    "-device",
+    "virtio-gpu-device,bus=virtio-mmio-bus.1",
     "-kernel",
 ]
 

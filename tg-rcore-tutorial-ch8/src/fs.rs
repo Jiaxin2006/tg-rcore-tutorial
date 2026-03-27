@@ -144,4 +144,33 @@ impl Fd {
             _ => -1,
         }
     }
+
+    /// 调整文件偏移量（SEEK_SET=0, SEEK_CUR=1, SEEK_END=2）
+    pub fn lseek(&self, offset: isize, whence: usize) -> isize {
+        match self {
+            Fd::File(f) => {
+                let inode = match &f.inode {
+                    Some(inode) => inode,
+                    None => return -1,
+                };
+                let new_off = match whence {
+                    0 => offset as usize,
+                    1 => (f.offset.get() as isize + offset) as usize,
+                    2 => (inode.size() as isize + offset) as usize,
+                    _ => return -1,
+                };
+                f.offset.set(new_off);
+                new_off as isize
+            }
+            _ => -1,
+        }
+    }
+
+    /// 获取文件大小（普通文件返回 inode 大小，其他返回 0）
+    pub fn file_size(&self) -> usize {
+        match self {
+            Fd::File(f) => f.inode.as_ref().map_or(0, |inode| inode.size()),
+            _ => 0,
+        }
+    }
 }

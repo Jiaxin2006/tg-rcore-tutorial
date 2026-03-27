@@ -167,6 +167,7 @@ cases = [
     "pipetest",
     "pipe_large_test",
     "ch8b_usertest",
+    "fb_demo",
     "user_shell",
     "initproc",
 ]
@@ -292,6 +293,7 @@ cases = [
     "ch8_deadlock_sem1",
     "ch8_deadlock_sem2",
     "ch8_usertest",
+    "fb_demo",
     "user_shell",
     "initproc",
 ]
