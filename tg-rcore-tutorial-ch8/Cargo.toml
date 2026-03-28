@@ -1,12 +1,12 @@
 [package]
-name = "jiaxin2006-tg-rcore-tutorial-t1l5"
-description = "Student AI4OSE lab crate for Chapter 8 of rCore Tutorial: multiprogramming and time-sharing multitasking."
+name = "jiaxin2006-tg-rcore-tutorial-t3l8"
+description = "Implemented Doom."
 version = "0.0.1-preview.1"
 edition = "2024"
 authors = ["Jiaxin Han <hanjx23@mails.tsinghua.edu.cn>"]
 repository = "https://github.com/Jiaxin2006/tg-rcore-tutorial"
 homepage = "https://github.com/Jiaxin2006/tg-rcore-tutorial/tree/test/tg-rcore-tutorial-ch8"
-documentation = "https://docs.rs/jiaxin2006-tg-rcore-tutorial-t1l5"
+documentation = "https://docs.rs/jiaxin2006-tg-rcore-tutorial-t3l8"
 license = "GPL-3.0"
 readme = "README.md"
 keywords = ["ai", "ai4ose", "kernel", "learning", "os"]
