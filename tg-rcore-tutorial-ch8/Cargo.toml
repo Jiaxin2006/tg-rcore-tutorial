@@ -43,7 +43,7 @@ tg-kernel-context = { package = "tg-rcore-tutorial-kernel-context", path = "../t
 tg-kernel-alloc = { package = "tg-rcore-tutorial-kernel-alloc", path = "../tg-rcore-tutorial-kernel-alloc", version = "0.4.8" }
 tg-kernel-vm = { package = "tg-rcore-tutorial-kernel-vm", path = "../tg-rcore-tutorial-kernel-vm", version = "0.4.8" }
 # 个人发布用 syscall 扩展包，与老师 crates.io 上的 tg-rcore-tutorial-syscall 名称/版本解耦
-tg-syscall = { package = "jiaxin2006-tg-rcore-tutorial-syscall-t3l8", path = "../jiaxin2006-tg-rcore-tutorial-syscall-t3l8", version = "0.0.1-preview.1", features = ["kernel"] }
+tg-syscall = { package = "jiaxin2006-tg-rcore-tutorial-syscall-t3l8", path = "../syscall-t3l8", version = "0.0.1-preview.1", features = ["kernel"] }
 tg-task-manage = { package = "tg-rcore-tutorial-task-manage", path = "../tg-rcore-tutorial-task-manage", version = "0.4.8", features = ["thread"] }
 tg-easy-fs = { package = "jiaxin2006-tg-rcore-tutorial-easy-fs-t1l4", path = "../tg-rcore-tutorial-easy-fs", version = "0.0.1-preview.1" }
 tg-signal = { package = "tg-rcore-tutorial-signal", path = "../tg-rcore-tutorial-signal", version = "0.4.8" }
