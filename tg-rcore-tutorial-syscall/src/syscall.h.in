@@ -316,6 +316,11 @@
 #define __NR_condvar_create 1030
 #define __NR_condvar_signal 1031
 #define __NR_condvar_wait 1032
+//
+#define __NR_rwlock_create 1034
+#define __NR_rwlock_read_lock 1035
+#define __NR_rwlock_write_lock 1036
+#define __NR_rwlock_unlock 1037
 
 #define __NR_spawn 400
 #define __NR_trace 410

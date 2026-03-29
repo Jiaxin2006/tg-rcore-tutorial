@@ -421,6 +421,12 @@ pub struct FcfsScheduler<I: Copy + Ord> {
     ready: VecDeque<I>,
 }
 
+/// 默认调度器。
+///
+/// 该别名刻意保持为 FCFS，使后续章节仅替换依赖到 `exp4-scheduler`
+/// 时，默认 ready queue 行为与原始 `push_back/pop_front` FIFO 保持一致。
+pub type DefaultScheduler<I> = FcfsScheduler<I>;
+
 impl<I: Copy + Ord> FcfsScheduler<I> {
     /// 创建 FCFS 调度器。
     pub fn new() -> Self {
@@ -463,6 +469,16 @@ impl<I: Copy + Ord> PluggableScheduler<I> for FcfsScheduler<I> {
 
     fn on_wakeup(&mut self, id: I, now: Tick) {
         self.enqueue(id, now);
+    }
+}
+
+impl<I: Copy + Ord> Schedule<I> for FcfsScheduler<I> {
+    fn add(&mut self, id: I) {
+        self.enqueue(id, 0);
+    }
+
+    fn fetch(&mut self) -> Option<I> {
+        self.pick_next(0)
     }
 }
 
@@ -536,6 +552,16 @@ impl<I: Copy + Ord> PluggableScheduler<I> for SjfScheduler<I> {
     }
 }
 
+impl<I: Copy + Ord> Schedule<I> for SjfScheduler<I> {
+    fn add(&mut self, id: I) {
+        self.enqueue(id, 0);
+    }
+
+    fn fetch(&mut self) -> Option<I> {
+        self.pick_next(0)
+    }
+}
+
 /// RR 调度器（时间片轮转）骨架。
 pub struct RrScheduler<I: Copy + Ord> {
     ready: VecDeque<I>,
@@ -596,6 +622,16 @@ impl<I: Copy + Ord> PluggableScheduler<I> for RrScheduler<I> {
 
     fn on_wakeup(&mut self, id: I, now: Tick) {
         self.enqueue(id, now);
+    }
+}
+
+impl<I: Copy + Ord> Schedule<I> for RrScheduler<I> {
+    fn add(&mut self, id: I) {
+        self.enqueue(id, 0);
+    }
+
+    fn fetch(&mut self) -> Option<I> {
+        self.pick_next(0)
     }
 }
 
@@ -689,6 +725,16 @@ impl<I: Copy + Ord, const N: usize> PluggableScheduler<I> for MlfqScheduler<I, N
 
     fn on_wakeup(&mut self, id: I, now: Tick) {
         self.enqueue(id, now);
+    }
+}
+
+impl<I: Copy + Ord, const N: usize> Schedule<I> for MlfqScheduler<I, N> {
+    fn add(&mut self, id: I) {
+        self.enqueue(id, 0);
+    }
+
+    fn fetch(&mut self) -> Option<I> {
+        self.pick_next(0)
     }
 }
 
@@ -820,5 +866,15 @@ impl<I: Copy + Ord> PluggableScheduler<I> for CfsLikeScheduler<I> {
         self.vruntime.remove(&id);
         self.weights.remove(&id);
         self.current_runtime = 0;
+    }
+}
+
+impl<I: Copy + Ord> Schedule<I> for CfsLikeScheduler<I> {
+    fn add(&mut self, id: I) {
+        self.enqueue(id, 0);
+    }
+
+    fn fetch(&mut self) -> Option<I> {
+        self.pick_next(0)
     }
 }

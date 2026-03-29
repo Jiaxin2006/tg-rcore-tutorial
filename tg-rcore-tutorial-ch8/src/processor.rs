@@ -9,22 +9,25 @@
 //! ## 核心类型
 //!
 //! - `ProcessorInner = PThreadManager<Process, Thread, ThreadManager, ProcManager>`
-//! - `ThreadManager`：管理线程实体和就绪队列
+//! - `ThreadManager`：由 `exp4-scheduler` 提供的兼容管理器，默认 FIFO
 //! - `ProcManager`：管理进程实体
 //!
 //! 教程阅读建议：
 //!
 //! - 先看 `ProcessorInner` 类型别名：先建立“统一入口，双层实体”的心智模型；
-//! - 再看 `ThreadManager` 与 `ProcManager` 的 `Manage` 实现：理解两层对象如何独立维护；
+//! - 再看 `ThreadManager` 与 `ProcManager` 的分工：线程侧由兼容管理器负责 ready queue；
 //! - 最后看 `Schedule<ThreadId>`：明确调度粒度已经从进程切换为线程。
 
 use crate::process::{Process, Thread};
-use alloc::collections::{BTreeMap, VecDeque};
+use alloc::collections::BTreeMap;
 use core::cell::UnsafeCell;
-use tg_task_manage::{Manage, PThreadManager, ProcId, Schedule, ThreadId};
+use exp4_scheduler::DefaultTaskManager;
+use tg_task_manage::{Manage, PThreadManager, ProcId, ThreadId};
 
 /// 处理器内部类型（双层管理器）
 pub type ProcessorInner = PThreadManager<Process, Thread, ThreadManager, ProcManager>;
+/// 默认线程管理器：底层由 `exp4-scheduler` 的 FCFS 兼容管理器提供。
+pub type ThreadManager = DefaultTaskManager<Thread, ThreadId>;
 
 /// 全局处理器包装（通过 `UnsafeCell` 允许内部可变）
 pub struct Processor {
@@ -48,43 +51,6 @@ impl Processor {
 
 /// 全局处理器实例
 pub static PROCESSOR: Processor = Processor::new();
-
-/// 线程管理器
-///
-/// 维护所有线程实体和就绪队列。
-/// 使用 FIFO 调度策略。
-pub struct ThreadManager {
-    /// 线程实体表（TID → Thread）
-    tasks: BTreeMap<ThreadId, Thread>,
-    /// 就绪队列
-    ready_queue: VecDeque<ThreadId>,
-}
-
-impl ThreadManager {
-    /// 创建空的线程管理器
-    pub fn new() -> Self {
-        Self { tasks: BTreeMap::new(), ready_queue: VecDeque::new() }
-    }
-}
-
-impl Manage<Thread, ThreadId> for ThreadManager {
-    /// 插入线程实体
-    #[inline]
-    fn insert(&mut self, id: ThreadId, task: Thread) { self.tasks.insert(id, task); }
-    /// 获取线程可变引用
-    #[inline]
-    fn get_mut(&mut self, id: ThreadId) -> Option<&mut Thread> { self.tasks.get_mut(&id) }
-    /// 删除线程实体
-    #[inline]
-    fn delete(&mut self, id: ThreadId) { self.tasks.remove(&id); }
-}
-
-impl Schedule<ThreadId> for ThreadManager {
-    /// 加入就绪队列
-    fn add(&mut self, id: ThreadId) { self.ready_queue.push_back(id); }
-    /// 取出下一个就绪线程
-    fn fetch(&mut self) -> Option<ThreadId> { self.ready_queue.pop_front() }
-}
 
 /// 进程管理器
 ///

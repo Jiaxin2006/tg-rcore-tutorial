@@ -16,6 +16,7 @@
 //! | `semaphore_list` | 信号量列表（进程内所有线程共享） |
 //! | `mutex_list` | 互斥锁列表 |
 //! | `condvar_list` | 条件变量列表 |
+//! | `rwlock_list` | 读写锁列表 |
 //!
 //! 教程阅读建议：
 //!
@@ -37,7 +38,7 @@ use tg_kernel_vm::{
 };
 use tg_signal::Signal;
 use tg_signal_impl::SignalImpl;
-use tg_sync::{Condvar, Mutex as MutexTrait, Semaphore};
+use tg_sync::{Condvar, Mutex as MutexTrait, RwLock, Semaphore};
 use tg_task_manage::{ProcId, ThreadId};
 use xmas_elf::{
     header::{self, HeaderPt2, Machine},
@@ -84,6 +85,8 @@ pub struct Process {
     pub mutex_list: Vec<Option<Arc<dyn MutexTrait>>>,
     /// 条件变量列表（**本章新增**，所有线程共享）
     pub condvar_list: Vec<Option<Arc<Condvar>>>,
+    /// 读写锁列表（实验扩展）
+    pub rwlock_list: Vec<Option<Arc<RwLock>>>,
     /// 是否启用死锁检测
     pub deadlock_detect_enabled: bool,
 }
@@ -136,6 +139,7 @@ impl Process {
                 semaphore_list: Vec::new(),
                 mutex_list: Vec::new(),
                 condvar_list: Vec::new(),
+                rwlock_list: Vec::new(),
                 deadlock_detect_enabled: self.deadlock_detect_enabled,
             },
             thread,
@@ -215,6 +219,7 @@ impl Process {
                 semaphore_list: Vec::new(),
                 mutex_list: Vec::new(),
                 condvar_list: Vec::new(),
+                rwlock_list: Vec::new(),
                 deadlock_detect_enabled: false,
             },
             thread,

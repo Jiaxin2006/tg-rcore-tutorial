@@ -6,9 +6,25 @@
 
 - 调度策略层：`FCFS / SJF / RR / MLFQ / CFS-like`
 - 内核接入层：`KernelSchedulerRuntime`
+- 向前兼容层：`DefaultTaskManager`（默认 FIFO，可直接替换旧 ready queue 管理器）
 
 如果只想在宿主机上比较不同调度算法，可以直接跑 `workload` 模拟。
 如果后续要把实验结果接进 rCore 风格内核，核心入口就是 `KernelSchedulerRuntime`。
+
+## 它和 `task-manage` 的关系
+
+`exp4-scheduler` 和 `tg-task-manage` 不是互斥关系，而是上下分层：
+
+- `tg-task-manage` 负责**任务管理机制**：`PManager / PThreadManager`、当前任务、阻塞/唤醒、进程-线程关系、wait 语义
+- `exp4-scheduler` 负责**调度策略**：ready queue 如何组织、`fetch` 选谁、是否抢占、时间片如何变化
+
+为了让后续章节能平滑替换旧的 FIFO ready queue，`exp4-scheduler` 额外提供了：
+
+- `DefaultScheduler<I> = FcfsScheduler<I>`
+- `DefaultTaskManager<T, I>`：实现 `tg_task_manage::Manage + Schedule` 的兼容管理器
+
+这意味着如果后续实验只是把原来的 `ThreadManager`/`ready_queue` 切到 `exp4-scheduler`，
+但仍然使用默认配置，那么行为仍然保持为原来的 FIFO。
 
 ## KernelSchedulerRuntime 接口
 
@@ -142,11 +158,23 @@ cargo test
 - 可比较的调度策略实现
 - 统一指标采集器 `MetricsCollector`
 - 可嵌入内核的桥接层 `KernelSchedulerRuntime`
+- 默认 FIFO 的兼容管理器 `DefaultTaskManager`
 
 因此后续真正接入 `tg-task-manage` 或某个 `tg-rcore-tutorial-chx` 时，推荐的方向是：
 
 - 由内核 crate 依赖 `exp4-scheduler`
-- 用 `KernelSchedulerRuntime` 替换原始 `ready_queue + add/fetch`
+- 若想保持默认行为不变，用 `DefaultTaskManager` 替换原始 `ready_queue + add/fetch`
+- 若想进一步研究抢占式策略，再在其上接 `KernelSchedulerRuntime`
 - 保留内核已有的任务实体与上下文切换逻辑
+
+## 真实替换验证
+
+当前仓库已经做过一次真实章节验证：
+
+- `tg-rcore-tutorial-ch8` 的线程调度管理器已切到 `exp4-scheduler::DefaultTaskManager`
+- `cargo check --manifest-path tg-rcore-tutorial-ch8/Cargo.toml --offline` 通过
+
+这说明 `exp4-scheduler` 已经不仅是“理论上可替换旧 scheduler”，
+而是已经完成了**默认 FIFO 行为不变**的实战替换验证。
 
 完整实验说明见 [`docs/exp4.md`](docs/exp4.md)。

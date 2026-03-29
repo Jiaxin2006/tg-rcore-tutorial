@@ -15,8 +15,15 @@ exclude = [
     "target/**",
 ]
 
+[features]
+default = ["task-manage-compat"]
+task-manage-compat = ["dep:tg-task-manage"]
+
 [lib]
 name = "exp4_scheduler"
+
+[dependencies]
+tg-task-manage = { package = "tg-rcore-tutorial-task-manage", path = "../tg-rcore-tutorial-task-manage", version = "0.4.8", optional = true }
 
 [[test]]
 name = "sched_compare"

@@ -1,75 +1,90 @@
-//! 同步原语实现
+//! 同步原语实现。
 //!
-//! 提供 5 种同步原语，接口与 `tg-rcore-tutorial-sync` 的内核 trait 保持一致：
-//!
-//! - [`SpinLock`]：基于 `AtomicBool` CAS 的自旋锁
-//! - [`MutexBlocking`]：基于 `std::sync` 的睡眠锁
-//! - [`Semaphore`]：经典计数信号量
-//! - [`Condvar`]：条件变量
-//! - [`RwLock`]：读写锁（原框架没有）
+//! `std` feature 下提供宿主机实验版本；
+//! `kernel` feature 下提供 `no_std + alloc` 的内核可移植版本。
 
-use std::collections::VecDeque;
-use std::sync::atomic::{AtomicBool, Ordering};
-use std::sync::{self, Arc};
+use alloc::collections::VecDeque;
+use alloc::sync::Arc;
+use alloc::vec::Vec;
+use core::sync::atomic::{AtomicBool, Ordering};
 
-/// 线程 ID 类型，与内核 `tg_task_manage::ThreadId` 对应。
+#[cfg(feature = "kernel")]
+use crate::up::UPIntrFreeCell;
+#[cfg(feature = "kernel")]
+use alloc::collections::BTreeMap;
+
+#[cfg(feature = "std")]
+use std::sync::{self, Mutex as StdMutex};
+
+/// 线程 ID 类型，与内核 `tg_task_manage::ThreadId` 对齐。
+#[cfg(feature = "std")]
 pub type ThreadId = usize;
-
-// ---------------------------------------------------------------------------
-// Mutex trait — 与内核 tg-rcore-tutorial-sync/src/mutex.rs 完全一致
-// ---------------------------------------------------------------------------
+/// 线程 ID 类型，与内核 `tg_task_manage::ThreadId` 对齐。
+#[cfg(feature = "kernel")]
+pub type ThreadId = tg_task_manage::ThreadId;
 
 /// 互斥锁 trait，匹配内核 `tg_sync::Mutex` 接口。
-///
-/// 返回值语义：
-/// - `lock(tid) -> true`：成功获取锁
-/// - `lock(tid) -> false`：锁被占用，调用方应阻塞该线程
-/// - `unlock() -> Some(tid)`：释放锁并唤醒等待线程 `tid`
-/// - `unlock() -> None`：释放锁，无等待者
 pub trait Mutex: Send + Sync {
-    /// 尝试获取锁。
     fn lock(&self, tid: ThreadId) -> bool;
-    /// 释放锁。
     fn unlock(&self) -> Option<ThreadId>;
-    /// 当前持锁者。
     fn holder(&self) -> Option<ThreadId>;
-    /// 等待队列快照。
     fn waiting(&self) -> Vec<ThreadId>;
+    fn should_block_on_fail(&self) -> bool {
+        true
+    }
 }
 
 // ===========================================================================
 // 1. SpinLock
 // ===========================================================================
 
-/// 基于 `AtomicBool` CAS 的自旋锁。
-///
-/// 在用户态测试中使用 `std::hint::spin_loop` 降低 CPU 消耗；
-/// 若嵌入内核则对应"关中断 + 原子自旋"场景。
+#[cfg(feature = "std")]
 pub struct SpinLock {
     locked: AtomicBool,
-    holder: std::sync::Mutex<Option<ThreadId>>,
-    wait_queue: std::sync::Mutex<VecDeque<ThreadId>>,
+    holder: StdMutex<Option<ThreadId>>,
+    wait_queue: StdMutex<VecDeque<ThreadId>>,
+}
+
+#[cfg(feature = "kernel")]
+pub struct SpinLock {
+    locked: AtomicBool,
+    inner: UPIntrFreeCell<SpinLockInner>,
+}
+
+#[cfg(feature = "kernel")]
+struct SpinLockInner {
+    holder: Option<ThreadId>,
+    wait_queue: VecDeque<ThreadId>,
 }
 
 impl SpinLock {
-    /// 创建一个新的自旋锁。
     pub fn new() -> Self {
-        Self {
-            locked: AtomicBool::new(false),
-            holder: std::sync::Mutex::new(None),
-            wait_queue: std::sync::Mutex::new(VecDeque::new()),
+        #[cfg(feature = "std")]
+        {
+            Self {
+                locked: AtomicBool::new(false),
+                holder: StdMutex::new(None),
+                wait_queue: StdMutex::new(VecDeque::new()),
+            }
+        }
+        #[cfg(feature = "kernel")]
+        {
+            Self {
+                locked: AtomicBool::new(false),
+                inner: unsafe {
+                    UPIntrFreeCell::new(SpinLockInner {
+                        holder: None,
+                        wait_queue: VecDeque::new(),
+                    })
+                },
+            }
         }
     }
 
-    /// 自旋获取锁（阻塞式，实际自旋等待直到成功）。
-    ///
-    /// 采用 TTAS + 指数退避：先只读轮询，看到空闲后才 CAS；
-    /// 失败次数增多时从 spin_loop → yield → sleep 逐级退避，
-    /// 保证在用户态（尤其 debug 无优化 + macOS ARM64）下也能推进。
+    #[cfg(feature = "std")]
     pub fn acquire(&self, tid: ThreadId) {
         let mut failures: u32 = 0;
         loop {
-            // TTAS: 只读检查，避免写争抢缓存行
             if self.locked.load(Ordering::Relaxed) {
                 Self::backoff(failures);
                 failures = failures.saturating_add(1);
@@ -87,6 +102,21 @@ impl SpinLock {
         }
     }
 
+    #[cfg(feature = "kernel")]
+    pub fn acquire(&self, tid: ThreadId) {
+        while !self
+            .locked
+            .compare_exchange_weak(false, true, Ordering::Acquire, Ordering::Relaxed)
+            .is_ok()
+        {
+            core::hint::spin_loop();
+        }
+        self.inner.exclusive_session(|inner| {
+            inner.holder = Some(tid);
+        });
+    }
+
+    #[cfg(feature = "std")]
     fn backoff(failures: u32) {
         if failures < 4 {
             std::hint::spin_loop();
@@ -97,22 +127,31 @@ impl SpinLock {
         }
     }
 
-    /// 释放自旋锁。
     pub fn release(&self) -> Option<ThreadId> {
-        *self.holder.lock().unwrap() = None;
-        self.locked.store(false, Ordering::Release);
-        None
+        #[cfg(feature = "std")]
+        {
+            *self.holder.lock().unwrap() = None;
+            self.locked.store(false, Ordering::Release);
+            None
+        }
+        #[cfg(feature = "kernel")]
+        {
+            self.inner.exclusive_session(|inner| {
+                inner.holder = None;
+            });
+            self.locked.store(false, Ordering::Release);
+            None
+        }
     }
 }
 
+#[cfg(feature = "std")]
 impl Mutex for SpinLock {
     fn lock(&self, tid: ThreadId) -> bool {
-        match self.locked.compare_exchange(
-            false,
-            true,
-            Ordering::Acquire,
-            Ordering::Relaxed,
-        ) {
+        match self
+            .locked
+            .compare_exchange(false, true, Ordering::Acquire, Ordering::Relaxed)
+        {
             Ok(_) => {
                 *self.holder.lock().unwrap() = Some(tid);
                 true
@@ -143,40 +182,108 @@ impl Mutex for SpinLock {
     fn waiting(&self) -> Vec<ThreadId> {
         self.wait_queue.lock().unwrap().iter().copied().collect()
     }
+
+    fn should_block_on_fail(&self) -> bool {
+        false
+    }
+}
+
+#[cfg(feature = "kernel")]
+impl Mutex for SpinLock {
+    fn lock(&self, tid: ThreadId) -> bool {
+        match self
+            .locked
+            .compare_exchange(false, true, Ordering::Acquire, Ordering::Relaxed)
+        {
+            Ok(_) => {
+                self.inner.exclusive_session(|inner| {
+                    inner.holder = Some(tid);
+                });
+                true
+            }
+            Err(_) => self.inner.exclusive_session(|inner| {
+                inner.wait_queue.push_back(tid);
+                false
+            }),
+        }
+    }
+
+    fn unlock(&self) -> Option<ThreadId> {
+        self.inner.exclusive_session(|inner| {
+            if let Some(waking) = inner.wait_queue.pop_front() {
+                inner.holder = Some(waking);
+                Some(waking)
+            } else {
+                inner.holder = None;
+                self.locked.store(false, Ordering::Release);
+                None
+            }
+        })
+    }
+
+    fn holder(&self) -> Option<ThreadId> {
+        self.inner.exclusive_session(|inner| inner.holder)
+    }
+
+    fn waiting(&self) -> Vec<ThreadId> {
+        self.inner
+            .exclusive_session(|inner| inner.wait_queue.iter().copied().collect())
+    }
+
+    fn should_block_on_fail(&self) -> bool {
+        false
+    }
 }
 
 // ===========================================================================
-// 2. MutexBlocking — 睡眠锁
+// 2. MutexBlocking
 // ===========================================================================
 
-/// 基于 `std::sync::Mutex` + `std::sync::Condvar` 的睡眠互斥锁。
-///
-/// 接口匹配内核 `tg_sync::MutexBlocking`。
+#[cfg(feature = "std")]
 pub struct MutexBlocking {
-    inner: std::sync::Mutex<MutexBlockingInner>,
+    inner: StdMutex<MutexBlockingInner>,
     condvar: sync::Condvar,
 }
 
-struct MutexBlockingInner {
+#[cfg(feature = "kernel")]
+pub struct MutexBlocking {
+    inner: UPIntrFreeCell<MutexBlockingInner>,
+}
+
+pub struct MutexBlockingInner {
     locked: bool,
     holder: Option<ThreadId>,
     wait_queue: VecDeque<ThreadId>,
 }
 
 impl MutexBlocking {
-    /// 创建一个新的阻塞互斥锁。
     pub fn new() -> Self {
-        Self {
-            inner: std::sync::Mutex::new(MutexBlockingInner {
-                locked: false,
-                holder: None,
-                wait_queue: VecDeque::new(),
-            }),
-            condvar: sync::Condvar::new(),
+        #[cfg(feature = "std")]
+        {
+            Self {
+                inner: StdMutex::new(MutexBlockingInner {
+                    locked: false,
+                    holder: None,
+                    wait_queue: VecDeque::new(),
+                }),
+                condvar: sync::Condvar::new(),
+            }
+        }
+        #[cfg(feature = "kernel")]
+        {
+            Self {
+                inner: unsafe {
+                    UPIntrFreeCell::new(MutexBlockingInner {
+                        locked: false,
+                        holder: None,
+                        wait_queue: VecDeque::new(),
+                    })
+                },
+            }
         }
     }
 
-    /// 阻塞式获取锁（实际 sleep 直到获取成功）。
+    #[cfg(feature = "std")]
     pub fn acquire(&self, tid: ThreadId) {
         let mut inner = self.inner.lock().unwrap();
         while inner.locked {
@@ -190,7 +297,7 @@ impl MutexBlocking {
         inner.holder = Some(tid);
     }
 
-    /// 带超时的阻塞式获取，返回是否成功。
+    #[cfg(feature = "std")]
     pub fn try_acquire_timeout(&self, tid: ThreadId, timeout: std::time::Duration) -> bool {
         let deadline = std::time::Instant::now() + timeout;
         let mut inner = self.inner.lock().unwrap();
@@ -203,7 +310,7 @@ impl MutexBlocking {
                 return false;
             }
             inner.wait_queue.push_back(tid);
-            let (guard, _timeout_result) = self.condvar.wait_timeout(inner, remaining).unwrap();
+            let (guard, _) = self.condvar.wait_timeout(inner, remaining).unwrap();
             inner = guard;
             if let Some(pos) = inner.wait_queue.iter().position(|&t| t == tid) {
                 inner.wait_queue.remove(pos);
@@ -214,7 +321,7 @@ impl MutexBlocking {
         true
     }
 
-    /// 释放锁并唤醒一个等待者。
+    #[cfg(feature = "std")]
     pub fn release(&self) -> Option<ThreadId> {
         let mut inner = self.inner.lock().unwrap();
         assert!(inner.locked);
@@ -230,6 +337,7 @@ impl MutexBlocking {
     }
 }
 
+#[cfg(feature = "std")]
 impl Mutex for MutexBlocking {
     fn lock(&self, tid: ThreadId) -> bool {
         let mut inner = self.inner.lock().unwrap();
@@ -265,38 +373,94 @@ impl Mutex for MutexBlocking {
     }
 }
 
+#[cfg(feature = "kernel")]
+impl Mutex for MutexBlocking {
+    fn lock(&self, tid: ThreadId) -> bool {
+        self.inner.exclusive_session(|inner| {
+            if inner.locked {
+                inner.wait_queue.push_back(tid);
+                false
+            } else {
+                inner.locked = true;
+                inner.holder = Some(tid);
+                true
+            }
+        })
+    }
+
+    fn unlock(&self) -> Option<ThreadId> {
+        self.inner.exclusive_session(|inner| {
+            assert!(inner.locked);
+            if let Some(waking) = inner.wait_queue.pop_front() {
+                inner.holder = Some(waking);
+                Some(waking)
+            } else {
+                inner.locked = false;
+                inner.holder = None;
+                None
+            }
+        })
+    }
+
+    fn holder(&self) -> Option<ThreadId> {
+        self.inner.exclusive_session(|inner| inner.holder)
+    }
+
+    fn waiting(&self) -> Vec<ThreadId> {
+        self.inner
+            .exclusive_session(|inner| inner.wait_queue.iter().copied().collect())
+    }
+}
+
 // ===========================================================================
 // 3. Semaphore
 // ===========================================================================
 
-/// 经典计数信号量，接口匹配内核 `tg_sync::Semaphore`。
-///
-/// 语义：
-/// - `count >= 0`：可用资源数
-/// - `count < 0`：有 `-count` 个线程在等待
+#[cfg(feature = "std")]
 pub struct Semaphore {
-    inner: std::sync::Mutex<SemaphoreInner>,
+    inner: StdMutex<SemaphoreInner>,
     condvar: sync::Condvar,
 }
 
-struct SemaphoreInner {
-    count: isize,
-    wait_queue: VecDeque<ThreadId>,
+#[cfg(feature = "kernel")]
+pub struct Semaphore {
+    pub inner: UPIntrFreeCell<SemaphoreInner>,
+}
+
+pub struct SemaphoreInner {
+    pub count: isize,
+    pub wait_queue: VecDeque<ThreadId>,
+    #[cfg(feature = "kernel")]
+    pub allocation: BTreeMap<ThreadId, usize>,
 }
 
 impl Semaphore {
-    /// 创建信号量，初始资源数 = `res_count`。
     pub fn new(res_count: usize) -> Self {
-        Self {
-            inner: std::sync::Mutex::new(SemaphoreInner {
-                count: res_count as isize,
-                wait_queue: VecDeque::new(),
-            }),
-            condvar: sync::Condvar::new(),
+        #[cfg(feature = "std")]
+        {
+            Self {
+                inner: StdMutex::new(SemaphoreInner {
+                    count: res_count as isize,
+                    wait_queue: VecDeque::new(),
+                }),
+                condvar: sync::Condvar::new(),
+            }
+        }
+        #[cfg(feature = "kernel")]
+        {
+            Self {
+                inner: unsafe {
+                    UPIntrFreeCell::new(SemaphoreInner {
+                        count: res_count as isize,
+                        wait_queue: VecDeque::new(),
+                        allocation: BTreeMap::new(),
+                    })
+                },
+            }
         }
     }
 
-    /// V 操作（释放）：计数 +1，若有等待者则唤醒。
+    #[cfg(feature = "std")]
     pub fn up(&self, _tid: ThreadId) -> Option<ThreadId> {
         let mut inner = self.inner.lock().unwrap();
         inner.count += 1;
@@ -308,9 +472,27 @@ impl Semaphore {
         }
     }
 
-    /// P 操作（获取）：计数 -1，不足则阻塞。
-    ///
-    /// 内核接口语义：返回 `false` 表示需要阻塞。
+    #[cfg(feature = "kernel")]
+    pub fn up(&self, tid: ThreadId) -> Option<ThreadId> {
+        self.inner.exclusive_session(|inner| {
+            if let Some(v) = inner.allocation.get_mut(&tid) {
+                if *v > 1 {
+                    *v -= 1;
+                } else {
+                    inner.allocation.remove(&tid);
+                }
+            }
+            inner.count += 1;
+            if let Some(waking_tid) = inner.wait_queue.pop_front() {
+                *inner.allocation.entry(waking_tid).or_insert(0) += 1;
+                Some(waking_tid)
+            } else {
+                None
+            }
+        })
+    }
+
+    #[cfg(feature = "std")]
     pub fn down(&self, tid: ThreadId) -> bool {
         let mut inner = self.inner.lock().unwrap();
         inner.count -= 1;
@@ -322,7 +504,21 @@ impl Semaphore {
         }
     }
 
-    /// 阻塞式 P 操作（实际等待直到获取资源）。
+    #[cfg(feature = "kernel")]
+    pub fn down(&self, tid: ThreadId) -> bool {
+        self.inner.exclusive_session(|inner| {
+            inner.count -= 1;
+            if inner.count < 0 {
+                inner.wait_queue.push_back(tid);
+                false
+            } else {
+                *inner.allocation.entry(tid).or_insert(0) += 1;
+                true
+            }
+        })
+    }
+
+    #[cfg(feature = "std")]
     pub fn acquire(&self, tid: ThreadId) {
         let mut inner = self.inner.lock().unwrap();
         inner.count -= 1;
@@ -334,25 +530,37 @@ impl Semaphore {
         }
     }
 
-    /// V 操作的阻塞版（唤醒一个等待者）。
+    #[cfg(feature = "std")]
     pub fn release(&self, tid: ThreadId) {
         let mut inner = self.inner.lock().unwrap();
         inner.count += 1;
-        if let Some(_waking) = inner.wait_queue.pop_front() {
+        if inner.wait_queue.pop_front().is_some() {
             drop(inner);
             self.condvar.notify_all();
         }
         let _ = tid;
     }
 
-    /// 当前计数。
+    #[cfg(feature = "std")]
     pub fn count(&self) -> isize {
         self.inner.lock().unwrap().count
     }
 
-    /// 等待队列长度。
+    #[cfg(feature = "std")]
     pub fn waiting_count(&self) -> usize {
         self.inner.lock().unwrap().wait_queue.len()
+    }
+
+    #[cfg(feature = "kernel")]
+    pub fn deadlock_snapshot(&self) -> (usize, VecDeque<ThreadId>, BTreeMap<ThreadId, usize>) {
+        self.inner.exclusive_session(|inner| {
+            let available = if inner.count > 0 {
+                inner.count as usize
+            } else {
+                0
+            };
+            (available, inner.wait_queue.clone(), inner.allocation.clone())
+        })
     }
 }
 
@@ -360,28 +568,45 @@ impl Semaphore {
 // 4. Condvar
 // ===========================================================================
 
-/// 条件变量，接口匹配内核 `tg_sync::Condvar`。
+#[cfg(feature = "std")]
 pub struct Condvar {
-    inner: std::sync::Mutex<CondvarInner>,
+    inner: StdMutex<CondvarInner>,
     sys_condvar: sync::Condvar,
 }
 
-struct CondvarInner {
-    wait_queue: VecDeque<ThreadId>,
+#[cfg(feature = "kernel")]
+pub struct Condvar {
+    pub inner: UPIntrFreeCell<CondvarInner>,
+}
+
+pub struct CondvarInner {
+    pub wait_queue: VecDeque<ThreadId>,
 }
 
 impl Condvar {
-    /// 创建新的条件变量。
     pub fn new() -> Self {
-        Self {
-            inner: std::sync::Mutex::new(CondvarInner {
-                wait_queue: VecDeque::new(),
-            }),
-            sys_condvar: sync::Condvar::new(),
+        #[cfg(feature = "std")]
+        {
+            Self {
+                inner: StdMutex::new(CondvarInner {
+                    wait_queue: VecDeque::new(),
+                }),
+                sys_condvar: sync::Condvar::new(),
+            }
+        }
+        #[cfg(feature = "kernel")]
+        {
+            Self {
+                inner: unsafe {
+                    UPIntrFreeCell::new(CondvarInner {
+                        wait_queue: VecDeque::new(),
+                    })
+                },
+            }
         }
     }
 
-    /// 唤醒一个等待线程（内核接口）。
+    #[cfg(feature = "std")]
     pub fn signal(&self) -> Option<ThreadId> {
         let mut inner = self.inner.lock().unwrap();
         let result = inner.wait_queue.pop_front();
@@ -391,15 +616,25 @@ impl Condvar {
         result
     }
 
-    /// 将线程标记为等待（内核接口，不调度）。
+    #[cfg(feature = "kernel")]
+    pub fn signal(&self) -> Option<ThreadId> {
+        self.inner.exclusive_session(|inner| inner.wait_queue.pop_front())
+    }
+
+    #[cfg(feature = "std")]
     pub fn wait_no_sched(&self, tid: ThreadId) -> bool {
         self.inner.lock().unwrap().wait_queue.push_back(tid);
         false
     }
 
-    /// 释放 mutex + 等待条件变量 + 重新获取 mutex（内核接口）。
-    ///
-    /// 简化实现，与内核 `tg_sync::Condvar::wait_with_mutex` 一致。
+    #[cfg(feature = "kernel")]
+    pub fn wait_no_sched(&self, tid: ThreadId) -> bool {
+        self.inner.exclusive_session(|inner| {
+            inner.wait_queue.push_back(tid);
+        });
+        false
+    }
+
     pub fn wait_with_mutex(
         &self,
         tid: ThreadId,
@@ -409,28 +644,32 @@ impl Condvar {
         (mutex.lock(tid), waking_tid)
     }
 
-    /// 等待队列长度。
+    #[cfg(feature = "std")]
     pub fn waiting_count(&self) -> usize {
         self.inner.lock().unwrap().wait_queue.len()
     }
 }
 
 // ===========================================================================
-// 5. RwLock — 读写锁（原框架不含）
+// 5. RwLock
 // ===========================================================================
 
-/// 读写锁：支持多读者并发 / 单写者独占。
-///
-/// 原 `tg-rcore-tutorial-sync` 框架不含此原语；
-/// 若嵌入内核需在 `SyncMutex` trait 添加 rwlock 相关系统调用。
+#[cfg(feature = "std")]
 pub struct RwLock {
-    inner: std::sync::Mutex<RwLockInner>,
+    inner: StdMutex<RwLockInner>,
     read_cv: sync::Condvar,
     write_cv: sync::Condvar,
 }
 
+#[cfg(feature = "kernel")]
+pub struct RwLock {
+    inner: UPIntrFreeCell<RwLockInner>,
+}
+
 struct RwLockInner {
     reader_count: usize,
+    #[cfg(feature = "kernel")]
+    reader_holders: BTreeMap<ThreadId, usize>,
     writer_active: bool,
     writer_holder: Option<ThreadId>,
     waiting_writers: VecDeque<ThreadId>,
@@ -438,22 +677,41 @@ struct RwLockInner {
 }
 
 impl RwLock {
-    /// 创建新的读写锁。
     pub fn new() -> Self {
-        Self {
-            inner: std::sync::Mutex::new(RwLockInner {
-                reader_count: 0,
-                writer_active: false,
-                writer_holder: None,
-                waiting_writers: VecDeque::new(),
-                waiting_readers: VecDeque::new(),
-            }),
-            read_cv: sync::Condvar::new(),
-            write_cv: sync::Condvar::new(),
+        #[cfg(feature = "std")]
+        {
+            Self {
+                inner: StdMutex::new(RwLockInner {
+                    reader_count: 0,
+                    #[cfg(feature = "kernel")]
+                    reader_holders: BTreeMap::new(),
+                    writer_active: false,
+                    writer_holder: None,
+                    waiting_writers: VecDeque::new(),
+                    waiting_readers: VecDeque::new(),
+                }),
+                read_cv: sync::Condvar::new(),
+                write_cv: sync::Condvar::new(),
+            }
+        }
+        #[cfg(feature = "kernel")]
+        {
+            Self {
+                inner: unsafe {
+                    UPIntrFreeCell::new(RwLockInner {
+                        reader_count: 0,
+                        reader_holders: BTreeMap::new(),
+                        writer_active: false,
+                        writer_holder: None,
+                        waiting_writers: VecDeque::new(),
+                        waiting_readers: VecDeque::new(),
+                    })
+                },
+            }
         }
     }
 
-    /// 获取读锁（阻塞式）。
+    #[cfg(feature = "std")]
     pub fn read_lock(&self, tid: ThreadId) {
         let mut inner = self.inner.lock().unwrap();
         while inner.writer_active || !inner.waiting_writers.is_empty() {
@@ -466,7 +724,31 @@ impl RwLock {
         inner.reader_count += 1;
     }
 
-    /// 释放读锁。
+    #[cfg(feature = "kernel")]
+    pub fn read_lock(&self, tid: ThreadId) {
+        loop {
+            if self.inner.exclusive_session(|inner| {
+                if inner.writer_active || !inner.waiting_writers.is_empty() {
+                    if !inner.waiting_readers.contains(&tid) {
+                        inner.waiting_readers.push_back(tid);
+                    }
+                    false
+                } else {
+                    if let Some(pos) = inner.waiting_readers.iter().position(|&t| t == tid) {
+                        inner.waiting_readers.remove(pos);
+                    }
+                    inner.reader_count += 1;
+                    *inner.reader_holders.entry(tid).or_insert(0) += 1;
+                    true
+                }
+            }) {
+                return;
+            }
+            core::hint::spin_loop();
+        }
+    }
+
+    #[cfg(feature = "std")]
     pub fn read_unlock(&self) {
         let mut inner = self.inner.lock().unwrap();
         assert!(inner.reader_count > 0);
@@ -476,7 +758,15 @@ impl RwLock {
         }
     }
 
-    /// 获取写锁（阻塞式）。
+    #[cfg(feature = "kernel")]
+    pub fn read_unlock(&self) {
+        self.inner.exclusive_session(|inner| {
+            assert!(inner.reader_count > 0);
+            inner.reader_count -= 1;
+        });
+    }
+
+    #[cfg(feature = "std")]
     pub fn write_lock(&self, tid: ThreadId) {
         let mut inner = self.inner.lock().unwrap();
         while inner.writer_active || inner.reader_count > 0 {
@@ -490,7 +780,31 @@ impl RwLock {
         inner.writer_holder = Some(tid);
     }
 
-    /// 释放写锁。
+    #[cfg(feature = "kernel")]
+    pub fn write_lock(&self, tid: ThreadId) {
+        loop {
+            if self.inner.exclusive_session(|inner| {
+                if inner.writer_active || inner.reader_count > 0 {
+                    if !inner.waiting_writers.contains(&tid) {
+                        inner.waiting_writers.push_back(tid);
+                    }
+                    false
+                } else {
+                    if let Some(pos) = inner.waiting_writers.iter().position(|&t| t == tid) {
+                        inner.waiting_writers.remove(pos);
+                    }
+                    inner.writer_active = true;
+                    inner.writer_holder = Some(tid);
+                    true
+                }
+            }) {
+                return;
+            }
+            core::hint::spin_loop();
+        }
+    }
+
+    #[cfg(feature = "std")]
     pub fn write_unlock(&self) {
         let mut inner = self.inner.lock().unwrap();
         assert!(inner.writer_active);
@@ -503,47 +817,151 @@ impl RwLock {
         }
     }
 
-    /// 当前活跃读者数。
+    #[cfg(feature = "kernel")]
+    pub fn write_unlock(&self) {
+        self.inner.exclusive_session(|inner| {
+            assert!(inner.writer_active);
+            inner.writer_active = false;
+            inner.writer_holder = None;
+        });
+    }
+
+    #[cfg(feature = "std")]
     pub fn reader_count(&self) -> usize {
         self.inner.lock().unwrap().reader_count
     }
 
-    /// 是否有写者活跃。
+    #[cfg(feature = "kernel")]
+    pub fn reader_count(&self) -> usize {
+        self.inner.exclusive_session(|inner| inner.reader_count)
+    }
+
+    #[cfg(feature = "std")]
     pub fn writer_active(&self) -> bool {
         self.inner.lock().unwrap().writer_active
     }
 
-    /// 等待中的写者数。
+    #[cfg(feature = "kernel")]
+    pub fn writer_active(&self) -> bool {
+        self.inner.exclusive_session(|inner| inner.writer_active)
+    }
+
+    #[cfg(feature = "std")]
     pub fn waiting_writers(&self) -> usize {
         self.inner.lock().unwrap().waiting_writers.len()
     }
 
-    /// 等待中的读者数。
+    #[cfg(feature = "kernel")]
+    pub fn waiting_writers(&self) -> usize {
+        self.inner.exclusive_session(|inner| inner.waiting_writers.len())
+    }
+
+    #[cfg(feature = "std")]
     pub fn waiting_readers(&self) -> usize {
         self.inner.lock().unwrap().waiting_readers.len()
+    }
+
+    #[cfg(feature = "kernel")]
+    pub fn waiting_readers(&self) -> usize {
+        self.inner.exclusive_session(|inner| inner.waiting_readers.len())
+    }
+
+    #[cfg(feature = "kernel")]
+    pub fn try_read(&self, tid: ThreadId) -> bool {
+        self.inner.exclusive_session(|inner| {
+            if inner.writer_active || !inner.waiting_writers.is_empty() {
+                if !inner.waiting_readers.contains(&tid) {
+                    inner.waiting_readers.push_back(tid);
+                }
+                false
+            } else {
+                if let Some(pos) = inner.waiting_readers.iter().position(|&t| t == tid) {
+                    inner.waiting_readers.remove(pos);
+                }
+                inner.reader_count += 1;
+                *inner.reader_holders.entry(tid).or_insert(0) += 1;
+                true
+            }
+        })
+    }
+
+    #[cfg(feature = "kernel")]
+    pub fn try_write(&self, tid: ThreadId) -> bool {
+        self.inner.exclusive_session(|inner| {
+            if inner.writer_active || inner.reader_count > 0 {
+                if !inner.waiting_writers.contains(&tid) {
+                    inner.waiting_writers.push_back(tid);
+                }
+                false
+            } else {
+                if let Some(pos) = inner.waiting_writers.iter().position(|&t| t == tid) {
+                    inner.waiting_writers.remove(pos);
+                }
+                inner.writer_active = true;
+                inner.writer_holder = Some(tid);
+                true
+            }
+        })
+    }
+
+    #[cfg(feature = "kernel")]
+    pub fn unlock_for(&self, tid: ThreadId) -> Vec<ThreadId> {
+        self.inner.exclusive_session(|inner| {
+            if inner.writer_holder == Some(tid) {
+                inner.writer_active = false;
+                inner.writer_holder = None;
+            } else if let Some(count) = inner.reader_holders.get_mut(&tid) {
+                assert!(inner.reader_count > 0);
+                inner.reader_count -= 1;
+                if *count > 1 {
+                    *count -= 1;
+                } else {
+                    inner.reader_holders.remove(&tid);
+                }
+            } else {
+                return Vec::new();
+            }
+
+            if !inner.writer_active && inner.reader_count == 0 {
+                if let Some(waking_writer) = inner.waiting_writers.pop_front() {
+                    inner.writer_active = true;
+                    inner.writer_holder = Some(waking_writer);
+                    let mut wakes = Vec::with_capacity(1);
+                    wakes.push(waking_writer);
+                    return wakes;
+                }
+                if !inner.waiting_readers.is_empty() {
+                    let readers: Vec<_> = inner.waiting_readers.drain(..).collect();
+                    inner.reader_count += readers.len();
+                    for &reader in &readers {
+                        *inner.reader_holders.entry(reader).or_insert(0) += 1;
+                    }
+                    return readers;
+                }
+            }
+            Vec::new()
+        })
     }
 }
 
 // ===========================================================================
-// Thread-safe wrappers for concurrent testing
+// Thread-safe wrappers for std testing
 // ===========================================================================
 
-/// 线程安全的阻塞式互斥锁包装，用于多线程场景测试。
-///
-/// 与 `Mutex` trait 的"返回 bool 让调用方决定是否阻塞"不同，
-/// 此包装直接在内部完成阻塞等待，适合 `std::thread` 并发测试。
+#[cfg(feature = "std")]
 pub struct BlockingMutexGuard<'a> {
     lock: &'a MutexBlocking,
 }
 
+#[cfg(feature = "std")]
 impl<'a> Drop for BlockingMutexGuard<'a> {
     fn drop(&mut self) {
         self.lock.release();
     }
 }
 
+#[cfg(feature = "std")]
 impl MutexBlocking {
-    /// RAII 风格获取锁。
     pub fn lock_guard(&self, tid: ThreadId) -> BlockingMutexGuard<'_> {
         self.acquire(tid);
         BlockingMutexGuard { lock: self }

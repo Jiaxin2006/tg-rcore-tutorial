@@ -334,6 +334,30 @@ pub fn condvar_wait(condvar_id: usize, mutex_id: usize) -> isize {
     unsafe { syscall2(SyscallId::CONDVAR_WAIT, condvar_id, mutex_id) }
 }
 
+/// 创建读写锁。
+#[inline]
+pub fn rwlock_create() -> isize {
+    unsafe { syscall0(SyscallId::RWLOCK_CREATE) }
+}
+
+/// 获取读锁。
+#[inline]
+pub fn rwlock_read_lock(rwlock_id: usize) -> isize {
+    unsafe { syscall1(SyscallId::RWLOCK_READ_LOCK, rwlock_id) }
+}
+
+/// 获取写锁。
+#[inline]
+pub fn rwlock_write_lock(rwlock_id: usize) -> isize {
+    unsafe { syscall1(SyscallId::RWLOCK_WRITE_LOCK, rwlock_id) }
+}
+
+/// 释放读写锁。
+#[inline]
+pub fn rwlock_unlock(rwlock_id: usize) -> isize {
+    unsafe { syscall1(SyscallId::RWLOCK_UNLOCK, rwlock_id) }
+}
+
 /// 启用死锁检测。
 #[inline]
 pub fn enable_deadlock_detect(is_enable: bool) -> isize {

@@ -171,6 +171,18 @@ pub trait SyncMutex: Sync {
     fn condvar_wait(&self, caller: Caller, condvar_id: usize, mutex_id: usize) -> isize {
         unimplemented!()
     }
+    fn rwlock_create(&self, caller: Caller) -> isize {
+        unimplemented!()
+    }
+    fn rwlock_read_lock(&self, caller: Caller, rwlock_id: usize) -> isize {
+        unimplemented!()
+    }
+    fn rwlock_write_lock(&self, caller: Caller, rwlock_id: usize) -> isize {
+        unimplemented!()
+    }
+    fn rwlock_unlock(&self, caller: Caller, rwlock_id: usize) -> isize {
+        unimplemented!()
+    }
     fn enable_deadlock_detect(&self, caller: Caller, is_enable: i32) -> isize {
         unimplemented!()
     }
@@ -332,6 +344,16 @@ pub fn handle(caller: Caller, id: SyscallId, args: [usize; 6]) -> SyscallResult 
         Id::CONDVAR_WAIT => SYNC_MUTEX.call(id, |sync_mutex| {
             sync_mutex.condvar_wait(caller, args[0], args[1])
         }),
+        Id::RWLOCK_CREATE => SYNC_MUTEX.call(id, |sync_mutex| sync_mutex.rwlock_create(caller)),
+        Id::RWLOCK_READ_LOCK => {
+            SYNC_MUTEX.call(id, |sync_mutex| sync_mutex.rwlock_read_lock(caller, args[0]))
+        }
+        Id::RWLOCK_WRITE_LOCK => {
+            SYNC_MUTEX.call(id, |sync_mutex| sync_mutex.rwlock_write_lock(caller, args[0]))
+        }
+        Id::RWLOCK_UNLOCK => {
+            SYNC_MUTEX.call(id, |sync_mutex| sync_mutex.rwlock_unlock(caller, args[0]))
+        }
         Id::ENABLE_DEADLOCK_DETECT => SYNC_MUTEX.call(id, |sync_mutex| {
             sync_mutex.enable_deadlock_detect(caller, args[0] as _)
         }),

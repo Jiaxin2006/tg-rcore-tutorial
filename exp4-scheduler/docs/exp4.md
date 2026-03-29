@@ -87,22 +87,29 @@ exp4-scheduler/
 
 ## 4. 当前状态与“如何接入内核”
 
-### 4.1 当前状态：还没有被真实内核实际接入，但已经有接入层实现
+### 4.1 当前状态：已经完成真实章节替换验证
 
 当前 `exp4-scheduler` 仍然是一个**独立实验 crate**，但它已经不只是纯模拟框架了，当前包含：
 
 - 在 [`src/kernel.rs`](/Users/hanjiaxin/Desktop/操作系统/tg-rcore-tutorial/exp4-scheduler/src/kernel.rs) 中实现 `KernelSchedulerRuntime`
 - 在 [`src/scheduler.rs`](/Users/hanjiaxin/Desktop/操作系统/tg-rcore-tutorial/exp4-scheduler/src/scheduler.rs) 中定义统一调度接口 `PluggableScheduler`
+- 在 [`src/compat.rs`](/Users/hanjiaxin/Desktop/操作系统/tg-rcore-tutorial/exp4-scheduler/src/compat.rs) 中实现 `DefaultTaskManager`
 - 在 [`src/workload.rs`](/Users/hanjiaxin/Desktop/操作系统/tg-rcore-tutorial/exp4-scheduler/src/workload.rs) 中用模拟 workload 驱动调度器
 - 用 `MetricsCollector` 收集等待时间、周转时间、吞吐量、延迟和饥饿指标
+
+并且当前仓库已经做过一次真实接入验证：
+
+- [`tg-rcore-tutorial-ch8/src/processor.rs`](/Users/hanjiaxin/Desktop/操作系统/tg-rcore-tutorial/tg-rcore-tutorial-ch8/src/processor.rs)
+  已将旧的手写 `ThreadManager` 替换为 `exp4-scheduler::DefaultTaskManager`
+- 默认策略保持 `FCFS`，因此行为仍与原来的 `VecDeque push_back/pop_front` FIFO 一致
+- `cargo check --manifest-path tg-rcore-tutorial-ch8/Cargo.toml --offline` 已验证通过
 
 也就是说，它现在已经完成了三层内容：
 
 - **策略插件**：`PluggableScheduler`
 - **统一统计**：`MetricsCollector`
 - **内核桥接层**：`KernelSchedulerRuntime`
-
-不过它**还没有真正被某个 `tg-rcore-tutorial-chx` 内核 crate 接到上下文切换路径上**。
+- **默认兼容层**：`DefaultTaskManager`
 
 ### 4.2 “接入内核”到底接什么
 
@@ -118,6 +125,22 @@ exp4-scheduler/
 | 任务退出 | `on_exit(id, now)` | 清理内部状态 |
 
 核心思想是：**上下文切换和任务状态维护属于内核机制，队列组织和抢占策略属于调度器插件。**
+
+### 4.2.1 它和 `tg-task-manage` 的分工
+
+`exp4-scheduler` 与 `tg-task-manage` 的关系可以概括为：
+
+- `tg-task-manage` 负责**任务管理机制**
+  - `PManager / PThreadManager`
+  - 当前任务、阻塞/唤醒、wait 语义
+  - 进程/线程之间的关系维护
+- `exp4-scheduler` 负责**调度策略与兼容层**
+  - `FCFS / RR / MLFQ / CFS-like` 等策略实现
+  - `KernelSchedulerRuntime`：把生命周期事件翻译成调度 hook
+  - `DefaultTaskManager`：向前兼容旧的 `Manage + Schedule` 风格
+
+所以它不是要“替掉整个 task manager”，而是要把 `task manager` 里原本固定写死的
+FIFO ready queue，替换成一个可插拔的调度层。
 
 ### 4.3 接入步骤
 
@@ -297,6 +320,13 @@ sched.make_current_exited();
 3. `MLFQ` 的交互型任务延迟显著低于 `FCFS`
 4. `CFS-like` 不会因为新任务加入就让老任务长期饿死
 5. 实验报表只依赖统一事件流，不依赖某个调度器私有逻辑
+
+当前仓库里已经实证满足一条更基础也更关键的标准：
+
+6. **只替换默认 scheduler 而不切换策略时，行为不变**
+   - `ThreadManager` 切到 `DefaultTaskManager`
+   - 默认仍为 `FCFS`
+   - `ch8` 编译通过，说明原有生命周期接口未被破坏
 
 
 ## 5. 常见 bug 清单

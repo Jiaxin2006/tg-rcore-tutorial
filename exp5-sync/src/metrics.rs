@@ -296,6 +296,10 @@ impl<M: Mutex> Mutex for InstrumentedMutex<M> {
     fn waiting(&self) -> Vec<ThreadId> {
         self.inner.waiting()
     }
+
+    fn should_block_on_fail(&self) -> bool {
+        self.inner.should_block_on_fail()
+    }
 }
 
 // ---------------------------------------------------------------------------

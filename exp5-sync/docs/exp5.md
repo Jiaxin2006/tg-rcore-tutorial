@@ -35,6 +35,52 @@ ch8 内核通过 `SyncMutex` syscall trait（`init_sync_mutex`）将这些原语
 | 经典场景 | 生产者-消费者、读者-写者、哲学家就餐 |
 | 反向测试 | 故意缺少 unlock / 错误顺序 → 断言超时/死锁 |
 
+### 当前状态
+
+当前 `exp5-sync` 已经调整为一个双模式 crate：
+
+- `std` 模式：用于宿主机多线程实验、指标采集和测试
+- `kernel` 模式：用于 `no_std + alloc` 内核环境，可直接作为 `ch8` 的同步库依赖
+
+这意味着后续章节如果只依赖 `exp5-sync`，基础同步原语
+`MutexBlocking / Semaphore / Condvar / UPIntrFreeCell`
+已经可以独立工作，不再必须额外依赖 `tg-rcore-tutorial-sync`。
+
+### 当前 syscall 组织
+
+当前仓库已经统一到一套个人维护的 syscall crate：
+
+- 内核侧：[`syscall-t3l8`](/Users/hanjiaxin/Desktop/操作系统/tg-rcore-tutorial/syscall-t3l8/Cargo.toml)
+- 用户态：[`tg-rcore-tutorial-user`](/Users/hanjiaxin/Desktop/操作系统/tg-rcore-tutorial/tg-rcore-tutorial-user/Cargo.toml)
+  也已经改为依赖 `syscall-t3l8`
+
+这意味着如果对外发布并长期维护，只需要维护你自己的
+`syscall-t3l8` 即可，不必同时维护另一套通用 syscall crate。
+
+### 真实替换验证
+
+当前仓库已经完成了真实章节替换验证：
+
+- [`tg-rcore-tutorial-ch8`](/Users/hanjiaxin/Desktop/操作系统/tg-rcore-tutorial/tg-rcore-tutorial-ch8/Cargo.toml)
+  已改为依赖 `exp5-sync` 的 `kernel` feature，替代原 `tg-sync`
+- [`tg-rcore-tutorial-user`](/Users/hanjiaxin/Desktop/操作系统/tg-rcore-tutorial/tg-rcore-tutorial-user/Cargo.toml)
+  已改为统一依赖 `syscall-t3l8`
+- `SpinLock` 已复用 `mutex_create(false)` 接入
+- `RwLock` 已补齐 `rwlock_create/read_lock/write_lock/unlock` syscall 链路
+
+验证命令：
+
+```bash
+cargo test --manifest-path exp5-sync/Cargo.toml --offline
+cargo check --manifest-path exp5-sync/Cargo.toml --no-default-features --features kernel --offline
+cargo check --manifest-path syscall-t3l8/Cargo.toml --features kernel --offline
+cargo check --manifest-path tg-rcore-tutorial-user/Cargo.toml --offline
+cargo check --manifest-path tg-rcore-tutorial-ch8/Cargo.toml --offline
+```
+
+这说明 `exp5-sync` 已经不是“接口兼容的实验 crate”，而是已经完成了
+**替换原同步层 + 接通 syscall + 通过真实章节编译验证** 的版本。
+
 ## 文件结构
 
 ```
@@ -104,16 +150,12 @@ cargo test --test sync_compare -- --nocapture --test-threads=1
 
 ## 嵌入内核的修改清单
 
-若要将本实验的扩展嵌入 ch8 内核：
+当前基础同步原语和 syscall 已经可以直接在 `ch8` 中工作；若要继续扩展，还可以做：
 
-1. **SpinLock**：在 `tg-rcore-tutorial-sync/src/` 新增 `spinlock.rs`，
-   使用 `UPIntrFreeCell` 替代 `std::sync::Mutex` 保护内部状态
-2. **RwLock**：在 `tg-rcore-tutorial-sync/src/` 新增 `rwlock.rs`，
-   需要在 `tg-rcore-tutorial-syscall` 的 `SyncMutex` trait 添加：
-   - `rwlock_create`, `read_lock`, `write_lock`, `rwlock_unlock`
-3. **Metrics**：在 ch8 的 `main.rs` 调度循环中，对 `MUTEX_LOCK` / `SEMAPHORE_DOWN` 等
+1. **Metrics**：在 ch8 的 `main.rs` 调度循环中，对 `MUTEX_LOCK` / `SEMAPHORE_DOWN` / `RWLOCK_*` 等
    系统调用路径添加时间戳记录
-4. **反向测试**：通过用户态测试程序（`tg-rcore-tutorial-user/src/bin/`）实现
+2. **用户态样例**：在 `tg-rcore-tutorial-user/src/bin/` 新增 `rwlock` 示例程序
+3. **反向测试**：通过用户态测试程序（`tg-rcore-tutorial-user/src/bin/`）实现
 
 ## 讨论题
 

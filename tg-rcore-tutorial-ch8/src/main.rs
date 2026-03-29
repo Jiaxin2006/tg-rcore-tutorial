@@ -262,7 +262,10 @@ extern "C" fn rust_main() -> ! {
                                 // ─── 本章新增：同步原语阻塞处理 ───
                                 // 当 semaphore_down / mutex_lock / condvar_wait 返回 -1 时，
                                 // 表示资源不可用，将当前线程标记为阻塞态
-                                Id::SEMAPHORE_DOWN | Id::MUTEX_LOCK | Id::CONDVAR_WAIT => {
+                                Id::SEMAPHORE_DOWN
+                                | Id::CONDVAR_WAIT
+                                | Id::RWLOCK_READ_LOCK
+                                | Id::RWLOCK_WRITE_LOCK => {
                                     let ctx = &mut task.context.context;
                                     *ctx.a_mut(0) = ret as _;
                                     if ret == -1 {
@@ -270,6 +273,15 @@ extern "C" fn rust_main() -> ! {
                                         unsafe { (*processor).make_current_blocked() };
                                     } else {
                                         // 成功获取：正常挂起（时间片轮转）
+                                        unsafe { (*processor).make_current_suspend() };
+                                    }
+                                }
+                                Id::MUTEX_LOCK => {
+                                    let ctx = &mut task.context.context;
+                                    *ctx.a_mut(0) = ret as _;
+                                    if ret == -1 {
+                                        unsafe { (*processor).make_current_blocked() };
+                                    } else {
                                         unsafe { (*processor).make_current_suspend() };
                                     }
                                 }
@@ -387,7 +399,7 @@ mod impls {
         AddressSpace, PageManager,
     };
     use tg_signal::SignalNo;
-    use tg_sync::{Condvar, Mutex as MutexTrait, MutexBlocking, Semaphore};
+    use tg_sync::{Condvar, Mutex as MutexTrait, MutexBlocking, RwLock, Semaphore, SpinLock};
     use tg_syscall::*;
     use tg_task_manage::{ProcId, ThreadId};
     use xmas_elf::ElfFile;
@@ -1028,7 +1040,9 @@ mod impls {
         fn mutex_create(&self, _caller: Caller, blocking: bool) -> isize {
             let new_mutex: Option<Arc<dyn MutexTrait>> = if blocking {
                 Some(Arc::new(MutexBlocking::new()))
-            } else { None };
+            } else {
+                Some(Arc::new(SpinLock::new()))
+            };
             let current_proc = PROCESSOR.get_mut().get_current_proc().unwrap();
             if let Some(id) = current_proc.mutex_list.iter().enumerate()
                 .find(|(_, item)| item.is_none()).map(|(id, _)| id)
@@ -1065,12 +1079,19 @@ mod impls {
                 )
             };
             if deadlock_enabled
+                && mutex.should_block_on_fail()
                 && mutex.holder().is_some()
                 && detect_mutex_deadlock(processor, pid, tid, mutex_id)
             {
                 return DEADLOCK_RET;
             }
-            if !mutex.lock(tid) { -1 } else { 0 }
+            if mutex.lock(tid) {
+                0
+            } else if mutex.should_block_on_fail() {
+                -1
+            } else {
+                -2
+            }
         }
 
         /// 创建条件变量
@@ -1112,6 +1133,51 @@ mod impls {
                 unsafe { (*processor).re_enque(waking_tid); }
             }
             if !flag { -1 } else { 0 }
+        }
+
+        /// 创建读写锁
+        fn rwlock_create(&self, _caller: Caller) -> isize {
+            let current_proc = PROCESSOR.get_mut().get_current_proc().unwrap();
+            let id = if let Some(id) = current_proc.rwlock_list.iter().enumerate()
+                .find(|(_, item)| item.is_none()).map(|(id, _)| id)
+            {
+                current_proc.rwlock_list[id] = Some(Arc::new(RwLock::new()));
+                id
+            } else {
+                current_proc.rwlock_list.push(Some(Arc::new(RwLock::new())));
+                current_proc.rwlock_list.len() - 1
+            };
+            id as isize
+        }
+
+        /// 获取读锁，不可用则阻塞
+        fn rwlock_read_lock(&self, _caller: Caller, rwlock_id: usize) -> isize {
+            let processor: *mut ProcessorInner = PROCESSOR.get_mut() as *mut ProcessorInner;
+            let tid = unsafe { (*processor).current().unwrap().tid };
+            let current_proc = unsafe { (*processor).get_current_proc().unwrap() };
+            let rwlock = Arc::clone(current_proc.rwlock_list[rwlock_id].as_ref().unwrap());
+            if rwlock.try_read(tid) { 0 } else { -1 }
+        }
+
+        /// 获取写锁，不可用则阻塞
+        fn rwlock_write_lock(&self, _caller: Caller, rwlock_id: usize) -> isize {
+            let processor: *mut ProcessorInner = PROCESSOR.get_mut() as *mut ProcessorInner;
+            let tid = unsafe { (*processor).current().unwrap().tid };
+            let current_proc = unsafe { (*processor).get_current_proc().unwrap() };
+            let rwlock = Arc::clone(current_proc.rwlock_list[rwlock_id].as_ref().unwrap());
+            if rwlock.try_write(tid) { 0 } else { -1 }
+        }
+
+        /// 释放读写锁，并唤醒等待线程
+        fn rwlock_unlock(&self, _caller: Caller, rwlock_id: usize) -> isize {
+            let processor: *mut ProcessorInner = PROCESSOR.get_mut() as *mut ProcessorInner;
+            let tid = unsafe { (*processor).current().unwrap().tid };
+            let current_proc = unsafe { (*processor).get_current_proc().unwrap() };
+            let rwlock = Arc::clone(current_proc.rwlock_list[rwlock_id].as_ref().unwrap());
+            for waking_tid in rwlock.unlock_for(tid) {
+                unsafe { (*processor).re_enque(waking_tid); }
+            }
+            0
         }
 
         /// 死锁检测

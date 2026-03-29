@@ -24,5 +24,5 @@ panic = "abort"
 
 [dependencies]
 tg-console = { package = "tg-rcore-tutorial-console", path = "../tg-rcore-tutorial-console", version = "0.4.2-preview.7" }
-tg-syscall = { package = "tg-rcore-tutorial-syscall", path = "../tg-rcore-tutorial-syscall", version = "0.4.2-preview.7", features = ["user"] }
+tg-syscall = { package = "jiaxin2006-tg-rcore-tutorial-syscall-t3l8", path = "../syscall-t3l8", version = "0.0.1-preview.1", features = ["user"] }
 customizable-buddy = "0.0.2"
