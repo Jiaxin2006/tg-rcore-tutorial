@@ -1,16 +1,23 @@
 [package]
 name = "jiaxin2006-tg-rcore-tutorial-t2l4"
 description = "Student AI4OSE lab crate for Experiment 4 of rCore Tutorial: pluggable scheduler comparison (FCFS, SJF, RR, MLFQ, CFS-like) with metrics collection."
-version = "0.0.1-preview.1"
+version = "0.0.2-preview.1"
 edition = "2024"
 authors = ["Jiaxin Han <hanjx23@mails.tsinghua.edu.cn>"]
 repository = "https://github.com/Jiaxin2006/tg-rcore-tutorial"
 homepage = "https://github.com/Jiaxin2006/tg-rcore-tutorial/tree/test/exp4-scheduler"
 documentation = "https://docs.rs/jiaxin2006-tg-rcore-tutorial-t2l4"
 license = "GPL-3.0"
-readme = "docs/exp4.md"
+readme = "README.md"
 keywords = ["ai", "ai4ose", "kernel", "learning", "os"]
 categories = ["algorithms", "simulation"]
 exclude = [
     "target/**",
 ]
+
+[lib]
+name = "exp4_scheduler"
+
+[[test]]
+name = "sched_compare"
+path = "user/sched_compare.rs"

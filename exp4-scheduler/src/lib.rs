@@ -7,9 +7,11 @@
 
 extern crate alloc;
 
+pub mod kernel;
 pub mod scheduler;
 pub mod workload;
 
+pub use kernel::KernelSchedulerRuntime;
 pub use scheduler::{
     CfsLikeScheduler, EventKind, ExperimentSummary, FcfsScheduler, MetricsCollector,
     MlfqScheduler, PluggableScheduler, RrScheduler, SchedDecision, SchedEvent, Schedule,
