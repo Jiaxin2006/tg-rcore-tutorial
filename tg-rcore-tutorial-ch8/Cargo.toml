@@ -52,6 +52,6 @@ tg-sync = { package = "jiaxin2006-tg-rcore-tutorial-sync-t1l5", path = "../tg-rc
 
 [build-dependencies]
 tg-linker = { package = "tg-rcore-tutorial-linker", path = "../tg-rcore-tutorial-linker", version = "0.4.8" }
-tg-easy-fs = { package = "jiaxin2006-tg-rcore-tutorial-easy-fs-t1l4", path = "../tg-rcore-tutorial-easy-fs", version = "0.0.1-preview.1" }
+tg-easy-fs = { package = "jiaxin2006-tg-rcore-tutorial-easy-fs-t3l8", path = "../tg-rcore-tutorial-easy-fs", version = "0.0.1-preview.1" }
 serde = { version = "1", features = ["derive"] }
 toml = "0.8"
