@@ -1,0 +1,27 @@
+[package]
+name = "jiaxin2006-tg-rcore-tutorial-syscall-t3l8"
+description = "Fork of rCore tutorial syscall definitions: framebuffer syscalls, UART input_getchar, lseek on IO trait (chapter 8 / Doom). Does not replace upstream tg-rcore-tutorial-syscall on crates.io."
+version = "0.0.1-preview.1"
+edition = "2024"
+authors = ["Jiaxin Han <hanjx23@mails.tsinghua.edu.cn>"]
+repository = "https://github.com/Jiaxin2006/tg-rcore-tutorial"
+homepage = "https://github.com/Jiaxin2006/tg-rcore-tutorial"
+documentation = "https://docs.rs/jiaxin2006-tg-rcore-tutorial-syscall-t3l8"
+license = "GPL-3.0"
+readme = "README.md"
+keywords = ["rcore", "syscall", "no-std", "riscv", "framebuffer"]
+categories = ["no-std", "embedded"]
+exclude = [".gitrepo", "systest.sh", "systest.txt", "sysdeps.txt"]
+
+[dependencies]
+spin = "0.9"
+bitflags = "1.2"
+# 与老师已发布的 signal-defs 对齐版本；保留依赖别名以匹配 `use tg_signal_defs::`
+tg-signal-defs = { package = "tg-rcore-tutorial-signal-defs", version = "0.4.8" }
+
+[features]
+kernel = []
+user = []
+
+[package.metadata.docs.rs]
+targets = ["riscv64gc-unknown-none-elf"]
