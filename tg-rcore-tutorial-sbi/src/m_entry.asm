@@ -70,17 +70,26 @@ m_trap_vector:
     # 调用 Rust 侧分发函数（msbi.rs::m_trap_handler）
     call m_trap_handler
 
-    # 跳过触发陷阱的 ecall 指令，避免返回后再次陷入
+    # 只有 S-mode ecall 需要跳过触发指令并把 SbiRet 留在 a0/a1 里；
+    # 异步中断必须完整恢复被打断现场，否则会破坏 S/U 态当前函数的参数寄存器。
+    csrr t0, mcause
+    li   t1, 9
+    bne  t0, t1, 1f
     csrr t0, mepc
     addi t0, t0, 4
     csrw mepc, t0
+    j    2f
+1:
+    ld a0, 32(sp)
+    ld a1, 40(sp)
+2:
 
     # 恢复寄存器
     ld ra, 0(sp)
     ld t0, 8(sp)
     ld t1, 16(sp)
     ld t2, 24(sp)
-    # 不恢复 a0/a1：它们保存 m_trap_handler 的返回值（SbiRet）
+    # ecall 路径保留 a0/a1 作为返回值；中断路径已在上面恢复原值
     ld a2, 48(sp)
     ld a3, 56(sp)
     ld a4, 64(sp)

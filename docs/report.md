@@ -99,6 +99,7 @@ T3L2: 真正棘手的问题反而出在内存布局上。最初 tangram 用户�
 - MLFQ 和 CFS 在混合负载下表现最优，交互延迟 P95 从 FCFS 的 43 降至 7（降幅 84%），饥饿完全消除
 - SJF 的 P95 反而比 FCFS 更差（56 vs 43），因为它按总 burst 排序，交互型短任务被长任务的"短估计"挤占
 - 原实验的 stride 调度无法直接比较（它解决的是"按优先级比例分配 CPU"，而非"减少交互延迟"）
+- 后续又补做了真实替换验证：`tg-rcore-tutorial-ch8` 的线程调度管理器已切到 `exp4-scheduler::DefaultTaskManager`，并通过 `cargo check`，说明 `exp4` 已经不仅是模拟器，而是能保持默认 FIFO 行为不变地替换旧 scheduler
 
 **原实验 vs 新实验的接口对比**
 
@@ -166,6 +167,7 @@ T3L2: 真正棘手的问题反而出在内存布局上。最初 tangram 用户�
 - **RwLock vs MutexBlocking（读者-写者场景）**：RwLock 的竞争次数降低 51%（374 vs 759），上下文切换降低 85%（111 vs 759），因为多读者可并发进入临界区而无需排队
 - **有序 vs 无序哲学家就餐**：无序模式触发死锁，仅完成 12/500 餐（2.4%）；有序模式 500 餐全部完成，平均等待时间降低 85%
 - **Spin vs Sleep 对比**：轻负载（800 ops）下 SpinLock 177μs vs MutexBlocking 179μs，差异很小；但自旋锁在高竞争 + debug 模式下需要 TTAS + 退避策略才能正常工作
+- 后续又补做了内核替换验证：`tg-rcore-tutorial-ch8` 已改为依赖 `exp5-sync` 的 `kernel` feature，用户态统一走 `syscall-t3l8`，并通过 `cargo check`，说明 `exp5` 已经完成了替换原 sync + 接通 syscall 的真实章节验证
 
 **反向测试覆盖（每个原语一个"故意出错→检测超时"的对照）**
 

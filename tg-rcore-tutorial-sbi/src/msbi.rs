@@ -151,6 +151,25 @@ fn handle_timer(time: u64) -> SbiRet {
             "csrc mip, {}",
             in(reg) (1 << 5), // Clear STIP
         );
+        asm!(
+            "csrs mie, {}",
+            in(reg) (1 << 7), // Enable MTIE so the next deadline can trap into M-mode.
+        );
+    }
+    SbiRet::success(0)
+}
+
+/// 将 machine timer interrupt 转发成 S 态可见的 supervisor timer interrupt。
+fn handle_machine_timer_interrupt() -> SbiRet {
+    unsafe {
+        asm!(
+            "csrs mip, {}",
+            in(reg) (1 << 5), // Set STIP for S-mode.
+        );
+        asm!(
+            "csrc mie, {}",
+            in(reg) (1 << 7), // Stop repeated MTI until S-mode arms the next timer.
+        );
     }
     SbiRet::success(0)
 }
@@ -228,6 +247,12 @@ pub fn m_trap_handler(
     // 我们需要此信息来验证这是一个 S-mode ecall。
     unsafe {
         core::arch::asm!("csrr {}, mcause", out(reg) mcause);
+    }
+
+    const MACHINE_TIMER_INTERRUPT: usize = (1usize << (usize::BITS - 1)) | 7;
+
+    if mcause == MACHINE_TIMER_INTERRUPT {
+        return handle_machine_timer_interrupt();
     }
 
     if mcause != 9 {

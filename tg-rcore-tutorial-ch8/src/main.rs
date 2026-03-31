@@ -83,7 +83,12 @@ use crate::{
     processor::{ProcManager, ProcessorInner, ThreadManager},
 };
 use alloc::alloc::alloc;
-use core::{alloc::Layout, cell::UnsafeCell, mem::MaybeUninit};
+use core::{
+    alloc::Layout,
+    cell::UnsafeCell,
+    mem::MaybeUninit,
+    sync::atomic::{AtomicBool, AtomicU64, Ordering},
+};
 use impls::Console;
 pub use processor::PROCESSOR;
 use riscv::register::*;
@@ -174,6 +179,172 @@ static KERNEL_SPACE: KernelSpace = KernelSpace::new();
 
 /// VirtIO-MMIO 区域（8 个 slot：块设备、GPU 等）
 pub const MMIO: &[(usize, usize)] = &[(0x1000_1000, 0x8000)];
+/// 单次时间片长度（与 ch3 保持一致）。
+const TIMER_INTERVAL: u64 = 12_500;
+/// 延迟调度标记：中断上下文只置位，安全点再真正切换。
+static NEED_RESCHED: AtomicBool = AtomicBool::new(false);
+/// 统一的逻辑 tick 计数。
+static TIMER_TICKS: AtomicU64 = AtomicU64::new(0);
+/// 在 S 态内核代码中实际接收到的时钟中断次数。
+static KERNEL_TIMER_INTERRUPTS: AtomicU64 = AtomicU64::new(0);
+/// 仅用于调试：避免在每次内核态 timer 到来时刷屏。
+static KERNEL_TIMER_LOGGED: AtomicBool = AtomicBool::new(false);
+/// 避免内核态非 timer 中断刷屏。
+static KERNEL_OTHER_INTERRUPT_LOGGED: AtomicBool = AtomicBool::new(false);
+/// 仅调试关键 syscall 路径，避免日志过量影响时序。
+static DEBUG_SYSCALL_LOGGED: AtomicBool = AtomicBool::new(false);
+/// 限制调度日志数量，避免刷屏影响时序。
+static DEBUG_SCHEDULE_LOGS: AtomicU64 = AtomicU64::new(0);
+#[inline]
+fn program_next_timer() {
+    #[cfg(target_arch = "riscv64")]
+    tg_sbi::set_timer(time::read64().wrapping_add(TIMER_INTERVAL));
+}
+
+#[inline]
+fn record_timer_tick() {
+    TIMER_TICKS.fetch_add(1, Ordering::SeqCst);
+    NEED_RESCHED.store(true, Ordering::SeqCst);
+    program_next_timer();
+}
+
+#[inline]
+fn take_need_resched() -> bool {
+    NEED_RESCHED.swap(false, Ordering::SeqCst)
+}
+
+#[cfg(target_arch = "riscv64")]
+#[inline]
+fn install_kernel_trap() {
+    unsafe { stvec::write(kernel_trap_entry as *const () as usize, stvec::TrapMode::Direct) };
+}
+
+#[cfg(not(target_arch = "riscv64"))]
+#[inline]
+fn install_kernel_trap() {}
+
+/// 在较长的内核路径中临时打开中断，让 timer 可以打断 S 态代码。
+struct KernelInterruptGuard {
+    enabled_before: bool,
+    #[cfg(target_arch = "riscv64")]
+    stvec_base_before: usize,
+    #[cfg(target_arch = "riscv64")]
+    stvec_mode_before: stvec::TrapMode,
+}
+
+impl KernelInterruptGuard {
+    #[inline]
+    fn enter() -> Self {
+        #[cfg(target_arch = "riscv64")]
+        {
+            let prev = stvec::read();
+            let stvec_base_before = prev.address();
+            let stvec_mode_before = prev.trap_mode().unwrap_or(stvec::TrapMode::Direct);
+            install_kernel_trap();
+            let enabled_before = sstatus::read().sie();
+            if !enabled_before {
+                unsafe { sstatus::set_sie() };
+            }
+            Self {
+                enabled_before,
+                stvec_base_before,
+                stvec_mode_before,
+            }
+        }
+        #[cfg(not(target_arch = "riscv64"))]
+        {
+            Self { enabled_before: false }
+        }
+    }
+}
+
+impl Drop for KernelInterruptGuard {
+    #[inline]
+    fn drop(&mut self) {
+        #[cfg(target_arch = "riscv64")]
+        {
+            unsafe {
+                stvec::write(self.stvec_base_before, self.stvec_mode_before);
+            }
+            if !self.enabled_before {
+                unsafe { sstatus::clear_sie() };
+            }
+        }
+    }
+}
+
+#[cfg(target_arch = "riscv64")]
+extern "C" fn kernel_trap_handler() {
+    use scause::{Interrupt, Trap};
+
+    match scause::read().cause() {
+        Trap::Interrupt(Interrupt::SupervisorTimer) => {
+            if !KERNEL_TIMER_LOGGED.swap(true, Ordering::SeqCst) {
+                log::info!("kernel timer interrupt observed");
+            }
+            KERNEL_TIMER_INTERRUPTS.fetch_add(1, Ordering::SeqCst);
+            record_timer_tick();
+        }
+        Trap::Interrupt(cause) => {
+            let sepc = sepc::read();
+            let stval = stval::read();
+            if !KERNEL_OTHER_INTERRUPT_LOGGED.swap(true, Ordering::SeqCst) {
+                log::warn!("unexpected kernel interrupt: {cause:?} sepc={sepc:#x} stval={stval:#x}");
+            }
+            panic!("unexpected kernel interrupt: {cause:?} sepc={sepc:#x} stval={stval:#x}");
+        }
+        cause => {
+            let sepc = sepc::read();
+            let stval = stval::read();
+            panic!("unexpected kernel exception: {cause:?} sepc={sepc:#x} stval={stval:#x}");
+        }
+    }
+}
+
+/// S 态内核代码使用的 trap 入口。
+///
+/// 它只负责保存寄存器并跳到一个很小的 Rust handler，真正的调度仍延后到安全点。
+#[cfg(target_arch = "riscv64")]
+#[unsafe(naked)]
+unsafe extern "C" fn kernel_trap_entry() {
+    core::arch::naked_asm!(
+        r"  .altmacro
+            .macro SAVE n
+                sd x\n, \n*8(sp)
+            .endm
+            .macro SAVE_ALL
+                sd x1, 1*8(sp)
+                .set n, 3
+                .rept 29
+                    SAVE %n
+                    .set n, n+1
+                .endr
+            .endm
+
+            .macro LOAD n
+                ld x\n, \n*8(sp)
+            .endm
+            .macro LOAD_ALL
+                ld x1, 1*8(sp)
+                .set n, 3
+                .rept 29
+                    LOAD %n
+                    .set n, n+1
+                .endr
+            .endm
+        ",
+        "   .option push",
+        "   .option nopic",
+        "   addi sp, sp, -32*8",
+        "   SAVE_ALL",
+        "   call {handler}",
+        "   LOAD_ALL",
+        "   addi sp, sp, 32*8",
+        "   sret",
+        "   .option pop",
+        handler = sym kernel_trap_handler,
+    )
+}
 
 /// 内核主函数
 ///
@@ -215,15 +386,19 @@ extern "C" fn rust_main() -> ! {
     tg_syscall::init_signal(&SyscallContext);
     tg_syscall::init_thread(&SyscallContext);       // 本章新增：线程系统调用
     tg_syscall::init_sync_mutex(&SyscallContext);   // 本章新增：同步原语系统调用
+    tg_syscall::init_kernel_test(&SyscallContext);  // T4 新增：内核态中断检查接口
     // 步骤 7b：VirtIO-GPU 帧缓冲（可选，供 doomgeneric / fb_demo）
     match crate::virtio_gpu::init() {
         Ok(()) => log::info!("virtio-gpu: framebuffer initialized"),
         Err(()) => log::warn!("virtio-gpu: unavailable (no GPU in this machine?)"),
     }
     tg_syscall::init_framebuffer(&SyscallContext);
-    // 步骤 8：加载 initproc（返回 Process + Thread）
-    let initproc = read_all(FS.open("initproc", OpenFlags::RDONLY).unwrap());
-    if let Some((process, thread)) = Process::from_elf(ElfFile::new(initproc.as_slice()).unwrap()) {
+    // 步骤 8：加载初始用户程序（默认 initproc，调试时可用 TG_CH8_INIT_APP 覆盖）
+    let init_app = option_env!("TG_CH8_INIT_APP").unwrap_or("initproc");
+    let init_app_data = read_all(FS.open(init_app, OpenFlags::RDONLY).unwrap());
+    if let Some((process, thread)) =
+        Process::from_elf(ElfFile::new(init_app_data.as_slice()).unwrap())
+    {
         // 初始化双层管理器：ProcManager（进程）+ ThreadManager（线程）
         PROCESSOR.get_mut().set_proc_manager(ProcManager::new());
         PROCESSOR.get_mut().set_manager(ThreadManager::new());
@@ -233,26 +408,101 @@ extern "C" fn rust_main() -> ! {
             .add_proc(pid, process, ProcId::from_usize(usize::MAX));
         PROCESSOR.get_mut().add(tid, thread, pid);
     }
+    unsafe { sie::set_stimer() };
+    program_next_timer();
 
     // ─── 主调度循环 ───
     loop {
         let processor: *mut ProcessorInner = PROCESSOR.get_mut() as *mut ProcessorInner;
-        if let Some(task) = unsafe { (*processor).find_next() } {
-            unsafe { task.context.execute(portal, ()) };
-
-            match scause::read().cause() {
+        if let Some(_tid) = unsafe { (*processor).find_next_id() } {
+            // 不把 `&mut task` 从调度器直接泄露到外层，避免主循环把线程借用
+            // 跨在整段 execute/trap 往返上；后续所有线程访问都限制在短闭包里。
+            let schedule_log_index = DEBUG_SCHEDULE_LOGS.fetch_add(1, Ordering::SeqCst);
+            if schedule_log_index < 16 {
+                let (tid, pc, sp, ra) = unsafe {
+                    (*processor)
+                        .with_current_task(|task| {
+                            (
+                                task.tid,
+                                task.context.context.pc(),
+                                task.context.context.sp(),
+                                task.context.context.ra(),
+                            )
+                        })
+                        .unwrap()
+                };
+                log::info!("schedule: tid={tid:?} pc={pc:#x} sp={sp:#x} ra={ra:#x}");
+            }
+            unsafe {
+                (*processor)
+                    .with_current_task(|task| task.context.execute(portal, ()))
+                    .unwrap();
+            }
+            let cause = scause::read().cause();
+            match cause {
+                scause::Trap::Interrupt(scause::Interrupt::SupervisorTimer) => {
+                    record_timer_tick();
+                    if take_need_resched() {
+                        unsafe { (*processor).make_current_suspend() };
+                    }
+                }
                 // ─── 系统调用 ───
                 scause::Trap::Exception(scause::Exception::UserEnvCall) => {
                     use tg_syscall::{SyscallId as Id, SyscallResult as Ret};
-                    let ctx = &mut task.context.context;
-                    ctx.move_next();
-                    let id: Id = ctx.a(7).into();
-                    let args = [ctx.a(0), ctx.a(1), ctx.a(2), ctx.a(3), ctx.a(4), ctx.a(5)];
+                    let (id, args, sepc_before) = unsafe {
+                        (*processor)
+                            .with_current_task(|task| {
+                                let ctx = &mut task.context.context;
+                                let sepc_before = ctx.pc();
+                                ctx.move_next();
+                                (
+                                    ctx.a(7).into(),
+                                    [ctx.a(0), ctx.a(1), ctx.a(2), ctx.a(3), ctx.a(4), ctx.a(5)],
+                                    sepc_before,
+                                )
+                            })
+                            .unwrap()
+                    };
+                    if matches!(
+                        id,
+                        Id::CLOCK_GETTIME | Id::KERNEL_INTERRUPT_CHECK | Id::EXIT | Id::CLONE
+                            | Id::WAIT4 | Id::EXECVE
+                    ) {
+                        log::info!(
+                            "syscall enter: id={id:?} sepc={sepc_before:#x} a0={:#x} a1={:#x}",
+                            args[0],
+                            args[1],
+                        );
+                    } else if !DEBUG_SYSCALL_LOGGED.swap(true, Ordering::SeqCst) {
+                        log::info!("first non-debug syscall seen: id={id:?} sepc={sepc_before:#x}");
+                    }
                     let syscall_ret = tg_syscall::handle(Caller { entity: 0, flow: 0 }, id, args);
+                    if matches!(
+                        id,
+                        Id::CLOCK_GETTIME | Id::KERNEL_INTERRUPT_CHECK | Id::EXIT | Id::CLONE
+                            | Id::WAIT4 | Id::EXECVE
+                    ) {
+                        match syscall_ret {
+                            Ret::Done(ret) => log::info!("syscall return: id={id:?} ret={ret}"),
+                            Ret::Unsupported(unsupported) => {
+                                log::info!(
+                                    "syscall return: id={id:?} unsupported={unsupported:?}"
+                                );
+                            }
+                        }
+                    }
 
                     // ─── 信号处理 ───
-                    let current_proc = unsafe { (*processor).get_current_proc().unwrap() };
-                    match current_proc.signal.handle_signals(ctx) {
+                    let signal_result = unsafe {
+                        (*processor)
+                            .with_current_task_proc(|task, current_proc| {
+                                current_proc
+                                    .signal
+                                    .handle_signals(&mut task.context.context)
+                            })
+                            .unwrap()
+                    };
+                    match signal_result {
                         SignalResult::ProcessKilled(exit_code) => unsafe {
                             (*processor).make_current_exited(exit_code as _)
                         },
@@ -266,8 +516,13 @@ extern "C" fn rust_main() -> ! {
                                 | Id::CONDVAR_WAIT
                                 | Id::RWLOCK_READ_LOCK
                                 | Id::RWLOCK_WRITE_LOCK => {
-                                    let ctx = &mut task.context.context;
-                                    *ctx.a_mut(0) = ret as _;
+                                    unsafe {
+                                        (*processor)
+                                            .with_current_task(|task| {
+                                                *task.context.context.a_mut(0) = ret as _;
+                                            })
+                                            .unwrap();
+                                    }
                                     if ret == -1 {
                                         // 阻塞：从就绪队列移除，等待资源释放后唤醒
                                         unsafe { (*processor).make_current_blocked() };
@@ -277,8 +532,13 @@ extern "C" fn rust_main() -> ! {
                                     }
                                 }
                                 Id::MUTEX_LOCK => {
-                                    let ctx = &mut task.context.context;
-                                    *ctx.a_mut(0) = ret as _;
+                                    unsafe {
+                                        (*processor)
+                                            .with_current_task(|task| {
+                                                *task.context.context.a_mut(0) = ret as _;
+                                            })
+                                            .unwrap();
+                                    }
                                     if ret == -1 {
                                         unsafe { (*processor).make_current_blocked() };
                                     } else {
@@ -286,8 +546,13 @@ extern "C" fn rust_main() -> ! {
                                     }
                                 }
                                 _ => {
-                                    let ctx = &mut task.context.context;
-                                    *ctx.a_mut(0) = ret as _;
+                                    unsafe {
+                                        (*processor)
+                                            .with_current_task(|task| {
+                                                *task.context.context.a_mut(0) = ret as _;
+                                            })
+                                            .unwrap();
+                                    }
                                     unsafe { (*processor).make_current_suspend() };
                                 }
                             },
@@ -385,12 +650,13 @@ mod impls {
         build_flags,
         fs::{read_all, Fd, FS},
         processor::ProcessorInner,
-        Sv39, Thread, PROCESSOR,
+        program_next_timer, KernelInterruptGuard,
+        KERNEL_TIMER_INTERRUPTS, Sv39, Thread, TIMER_INTERVAL, PROCESSOR,
     };
     use alloc::collections::BTreeMap;
     use alloc::sync::Arc;
     use alloc::{alloc::alloc_zeroed, string::String, vec::Vec};
-    use core::{alloc::Layout, cmp::min, ptr::NonNull};
+    use core::{alloc::Layout, cmp::min, ptr::NonNull, sync::atomic::Ordering};
     use spin::Mutex;
     use tg_console::log;
     use tg_easy_fs::{make_pipe, FSManager, OpenFlags, UserBuffer};
@@ -795,9 +1061,15 @@ mod impls {
         /// fork：创建子进程（返回 Process + Thread）
         fn fork(&self, _caller: Caller) -> isize {
             let processor: *mut ProcessorInner = PROCESSOR.get_mut() as *mut ProcessorInner;
-            let current_proc = unsafe { (*processor).get_current_proc().unwrap() };
-            let parent_pid = current_proc.pid;
-            let (proc, mut thread) = current_proc.fork().unwrap();
+            let (parent_pid, proc, mut thread) = unsafe {
+                (*processor)
+                    .with_current_proc(|current_proc| {
+                        let parent_pid = current_proc.pid;
+                        let (proc, thread) = current_proc.fork().unwrap();
+                        (parent_pid, proc, thread)
+                    })
+                    .unwrap()
+            };
             let pid = proc.pid;
             *thread.context.context.a_mut(0) = 0 as _;
             unsafe {
@@ -838,20 +1110,32 @@ mod impls {
 
         fn wait(&self, _caller: Caller, pid: isize, exit_code_ptr: usize) -> isize {
             let processor: *mut ProcessorInner = PROCESSOR.get_mut() as *mut ProcessorInner;
-            let current = unsafe { (*processor).get_current_proc().unwrap() };
             const WRITABLE: VmFlags<Sv39> = build_flags("W_V");
             if let Some((dead_pid, exit_code)) =
                 unsafe { (*processor).wait(ProcId::from_usize(pid as usize)) }
             {
-                if let Some(mut ptr) = current.address_space
-                    .translate::<i32>(VAddr::new(exit_code_ptr), WRITABLE)
-                { unsafe { *ptr.as_mut() = exit_code as i32 }; }
-                return dead_pid.get_usize() as isize;
+                let wrote = unsafe {
+                    (*processor)
+                        .with_current_proc(|current| {
+                            current
+                                .address_space
+                                .translate::<i32>(VAddr::new(exit_code_ptr), WRITABLE)
+                                .map(|mut ptr| {
+                                    *ptr.as_mut() = exit_code as i32;
+                                })
+                                .is_some()
+                        })
+                        .unwrap()
+                };
+                if !wrote {
+                    return -1;
+                }
+                dead_pid.get_usize() as isize
             } else { return -1; }
         }
 
         fn getpid(&self, _caller: Caller) -> isize {
-            PROCESSOR.get_mut().get_current_proc().unwrap().pid.get_usize() as _
+            PROCESSOR.get_mut().current_pid().unwrap().get_usize() as _
         }
     }
 
@@ -866,6 +1150,7 @@ mod impls {
             const WRITABLE: VmFlags<Sv39> = build_flags("W_V");
             match clock_id {
                 ClockId::CLOCK_MONOTONIC => {
+                    log::info!("clock_gettime: tp={tp:#x}");
                     if let Some(mut ptr) = PROCESSOR.get_mut().get_current_proc().unwrap()
                         .address_space.translate(VAddr::new(tp), WRITABLE)
                     {
@@ -878,6 +1163,51 @@ mod impls {
                     } else { log::error!("ptr not readable"); -1 }
                 }
                 _ => -1,
+            }
+        }
+    }
+
+    impl tg_syscall::KernelTest for SyscallContext {
+        fn kernel_interrupt_check(&self, _caller: Caller, min_interrupts: usize) -> isize {
+            let min_interrupts = min_interrupts.max(1) as u64;
+            let start_interrupts = KERNEL_TIMER_INTERRUPTS.load(Ordering::SeqCst);
+            let start_time = riscv::register::time::read64();
+            let timeout = TIMER_INTERVAL.saturating_mul(min_interrupts + 32);
+            log::info!(
+                "kernel_interrupt_check: enter min_interrupts={} start_interrupts={} start_time={}",
+                min_interrupts,
+                start_interrupts,
+                start_time,
+            );
+            let _interrupt_guard = KernelInterruptGuard::enter();
+            unsafe {
+                riscv::register::sie::set_stimer();
+            }
+            program_next_timer();
+
+            loop {
+                let observed =
+                    KERNEL_TIMER_INTERRUPTS.load(Ordering::SeqCst).saturating_sub(start_interrupts);
+                if observed >= min_interrupts {
+                    log::info!("kernel_interrupt_check: success observed={observed}");
+                    return observed as isize;
+                }
+                if riscv::register::time::read64().wrapping_sub(start_time) >= timeout {
+                    let sie = riscv::register::sie::read();
+                    let sip = riscv::register::sip::read();
+                    let sstatus = riscv::register::sstatus::read();
+                    log::warn!(
+                        "kernel_interrupt_check timeout: observed={observed} sie.stimer={} sip.stimer={} sstatus.sie={} ticks={}",
+                        sie.stimer(),
+                        sip.stimer(),
+                        sstatus.sie(),
+                        crate::TIMER_TICKS.load(Ordering::SeqCst),
+                    );
+                    return observed as isize;
+                }
+                for _ in 0..4096 {
+                    core::hint::spin_loop();
+                }
             }
         }
     }
@@ -926,9 +1256,14 @@ mod impls {
 
         fn sigreturn(&self, _caller: Caller) -> isize {
             let processor: *mut ProcessorInner = PROCESSOR.get_mut() as *mut ProcessorInner;
-            let current = unsafe { (*processor).get_current_proc().unwrap() };
-            let current_thread = unsafe { (*processor).current().unwrap() };
-            if current.signal.sig_return(&mut current_thread.context.context) { 0 } else { -1 }
+            let ok = unsafe {
+                (*processor)
+                    .with_current_task_proc(|current_thread, current_proc| {
+                        current_proc.signal.sig_return(&mut current_thread.context.context)
+                    })
+                    .unwrap()
+            };
+            if ok { 0 } else { -1 }
         }
     }
 
@@ -940,42 +1275,57 @@ mod impls {
         /// 创建新的执行上下文，入口为 entry，参数为 arg。
         fn thread_create(&self, _caller: Caller, entry: usize, arg: usize) -> isize {
             let processor: *mut ProcessorInner = PROCESSOR.get_mut() as *mut ProcessorInner;
-            let current_proc = unsafe { (*processor).get_current_proc().unwrap() };
-            // 从最高用户栈位置向下搜索空闲的页表区域
-            let mut vpn = VPN::<Sv39>::new((1 << 26) - 2);
-            let addrspace = &mut current_proc.address_space;
-            loop {
-                let idx = vpn.index_in(Sv39::MAX_LEVEL);
-                if !addrspace.root()[idx].is_valid() { break; }
-                vpn = VPN::<Sv39>::new(vpn.val() - 3);
-            }
             // 分配 2 页用户栈
             let stack = unsafe {
                 alloc_zeroed(Layout::from_size_align_unchecked(
                     2 << Sv39::PAGE_BITS, 1 << Sv39::PAGE_BITS,
                 ))
             };
-            addrspace.map_extern(vpn..vpn + 2, PPN::new(stack as usize >> Sv39::PAGE_BITS), build_flags("U_WRV"));
-            let satp = (8 << 60) | addrspace.root_ppn().val();
+            let (pid, satp, user_sp) = unsafe {
+                (*processor)
+                    .with_current_proc(|current_proc| {
+                        // 从最高用户栈位置向下搜索空闲的页表区域
+                        let mut vpn = VPN::<Sv39>::new((1 << 26) - 2);
+                        let addrspace = &mut current_proc.address_space;
+                        loop {
+                            let idx = vpn.index_in(Sv39::MAX_LEVEL);
+                            if !addrspace.root()[idx].is_valid() {
+                                break;
+                            }
+                            vpn = VPN::<Sv39>::new(vpn.val() - 3);
+                        }
+                        addrspace.map_extern(
+                            vpn..vpn + 2,
+                            PPN::new(stack as usize >> Sv39::PAGE_BITS),
+                            build_flags("U_WRV"),
+                        );
+                        (
+                            current_proc.pid,
+                            (8 << 60) | addrspace.root_ppn().val(),
+                            (vpn + 2).base().val(),
+                        )
+                    })
+                    .unwrap()
+            };
             let mut context = tg_kernel_context::LocalContext::user(entry);
-            *context.sp_mut() = (vpn + 2).base().val();
+            *context.sp_mut() = user_sp;
             *context.a_mut(0) = arg;
             let thread = Thread::new(satp, context);
             let tid = thread.tid;
-            unsafe { (*processor).add(tid, thread, current_proc.pid); }
+            unsafe { (*processor).add(tid, thread, pid); }
             tid.get_usize() as _
         }
 
         /// gettid：获取当前线程 TID
         fn gettid(&self, _caller: Caller) -> isize {
-            PROCESSOR.get_mut().current().unwrap().tid.get_usize() as _
+            PROCESSOR.get_mut().current_tid().unwrap().get_usize() as _
         }
 
         /// waittid：等待指定线程退出
         fn waittid(&self, _caller: Caller, tid: usize) -> isize {
             let processor: *mut ProcessorInner = PROCESSOR.get_mut() as *mut ProcessorInner;
-            let current_thread = unsafe { (*processor).current().unwrap() };
-            if tid == current_thread.tid.get_usize() { return -1; }
+            let current_tid = unsafe { (*processor).current_tid().unwrap() };
+            if tid == current_tid.get_usize() { return -1; }
             if let Some(exit_code) = unsafe { (*processor).waittid(ThreadId::from_usize(tid)) } {
                 exit_code
             } else { -1 }
@@ -1005,10 +1355,16 @@ mod impls {
         /// V 操作：释放信号量，唤醒等待线程
         fn semaphore_up(&self, _caller: Caller, sem_id: usize) -> isize {
             let processor: *mut ProcessorInner = PROCESSOR.get_mut() as *mut ProcessorInner;
-            let current = unsafe { (*processor).current().unwrap() };
-            let tid = current.tid;
-            let current_proc = unsafe { (*processor).get_current_proc().unwrap() };
-            let sem = Arc::clone(current_proc.semaphore_list[sem_id].as_ref().unwrap());
+            let (tid, sem) = unsafe {
+                (*processor)
+                    .with_current_task_proc(|current, current_proc| {
+                        (
+                            current.tid,
+                            Arc::clone(current_proc.semaphore_list[sem_id].as_ref().unwrap()),
+                        )
+                    })
+                    .unwrap()
+            };
             if let Some(waking_tid) = sem.up(tid) {
                 unsafe { (*processor).re_enque(waking_tid); }
             }
@@ -1018,7 +1374,7 @@ mod impls {
         /// P 操作：获取信号量，不可用则阻塞
         fn semaphore_down(&self, _caller: Caller, sem_id: usize) -> isize {
             let processor: *mut ProcessorInner = PROCESSOR.get_mut() as *mut ProcessorInner;
-            let tid = unsafe { (*processor).current().unwrap().tid };
+            let tid = unsafe { (*processor).current_tid().unwrap() };
             let (pid, deadlock_enabled, sem) = {
                 let current_proc = unsafe { (*processor).get_current_proc().unwrap() };
                 (
@@ -1058,8 +1414,13 @@ mod impls {
         /// 解锁，唤醒等待线程
         fn mutex_unlock(&self, _caller: Caller, mutex_id: usize) -> isize {
             let processor: *mut ProcessorInner = PROCESSOR.get_mut() as *mut ProcessorInner;
-            let current_proc = unsafe { (*processor).get_current_proc().unwrap() };
-            let mutex = Arc::clone(current_proc.mutex_list[mutex_id].as_ref().unwrap());
+            let mutex = unsafe {
+                (*processor)
+                    .with_current_proc(|current_proc| {
+                        Arc::clone(current_proc.mutex_list[mutex_id].as_ref().unwrap())
+                    })
+                    .unwrap()
+            };
             if let Some(tid) = mutex.unlock() {
                 unsafe { (*processor).re_enque(tid); }
             }
@@ -1069,7 +1430,7 @@ mod impls {
         /// 加锁，已被占用则阻塞
         fn mutex_lock(&self, _caller: Caller, mutex_id: usize) -> isize {
             let processor: *mut ProcessorInner = PROCESSOR.get_mut() as *mut ProcessorInner;
-            let tid = unsafe { (*processor).current().unwrap().tid };
+            let tid = unsafe { (*processor).current_tid().unwrap() };
             let (pid, deadlock_enabled, mutex) = {
                 let current_proc = unsafe { (*processor).get_current_proc().unwrap() };
                 (
@@ -1112,8 +1473,13 @@ mod impls {
         /// 唤醒一个等待线程
         fn condvar_signal(&self, _caller: Caller, condvar_id: usize) -> isize {
             let processor: *mut ProcessorInner = PROCESSOR.get_mut() as *mut ProcessorInner;
-            let current_proc = unsafe { (*processor).get_current_proc().unwrap() };
-            let condvar = Arc::clone(current_proc.condvar_list[condvar_id].as_ref().unwrap());
+            let condvar = unsafe {
+                (*processor)
+                    .with_current_proc(|current_proc| {
+                        Arc::clone(current_proc.condvar_list[condvar_id].as_ref().unwrap())
+                    })
+                    .unwrap()
+            };
             if let Some(tid) = condvar.signal() {
                 unsafe { (*processor).re_enque(tid); }
             }
@@ -1123,11 +1489,17 @@ mod impls {
         /// 等待条件变量（释放锁 + 阻塞 + 重新获取锁）
         fn condvar_wait(&self, _caller: Caller, condvar_id: usize, mutex_id: usize) -> isize {
             let processor: *mut ProcessorInner = PROCESSOR.get_mut() as *mut ProcessorInner;
-            let current = unsafe { (*processor).current().unwrap() };
-            let tid = current.tid;
-            let current_proc = unsafe { (*processor).get_current_proc().unwrap() };
-            let condvar = Arc::clone(current_proc.condvar_list[condvar_id].as_ref().unwrap());
-            let mutex = Arc::clone(current_proc.mutex_list[mutex_id].as_ref().unwrap());
+            let (tid, condvar, mutex) = unsafe {
+                (*processor)
+                    .with_current_task_proc(|current, current_proc| {
+                        (
+                            current.tid,
+                            Arc::clone(current_proc.condvar_list[condvar_id].as_ref().unwrap()),
+                            Arc::clone(current_proc.mutex_list[mutex_id].as_ref().unwrap()),
+                        )
+                    })
+                    .unwrap()
+            };
             let (flag, waking_tid) = condvar.wait_with_mutex(tid, mutex);
             if let Some(waking_tid) = waking_tid {
                 unsafe { (*processor).re_enque(waking_tid); }
@@ -1153,27 +1525,48 @@ mod impls {
         /// 获取读锁，不可用则阻塞
         fn rwlock_read_lock(&self, _caller: Caller, rwlock_id: usize) -> isize {
             let processor: *mut ProcessorInner = PROCESSOR.get_mut() as *mut ProcessorInner;
-            let tid = unsafe { (*processor).current().unwrap().tid };
-            let current_proc = unsafe { (*processor).get_current_proc().unwrap() };
-            let rwlock = Arc::clone(current_proc.rwlock_list[rwlock_id].as_ref().unwrap());
+            let (tid, rwlock) = unsafe {
+                (*processor)
+                    .with_current_task_proc(|current, current_proc| {
+                        (
+                            current.tid,
+                            Arc::clone(current_proc.rwlock_list[rwlock_id].as_ref().unwrap()),
+                        )
+                    })
+                    .unwrap()
+            };
             if rwlock.try_read(tid) { 0 } else { -1 }
         }
 
         /// 获取写锁，不可用则阻塞
         fn rwlock_write_lock(&self, _caller: Caller, rwlock_id: usize) -> isize {
             let processor: *mut ProcessorInner = PROCESSOR.get_mut() as *mut ProcessorInner;
-            let tid = unsafe { (*processor).current().unwrap().tid };
-            let current_proc = unsafe { (*processor).get_current_proc().unwrap() };
-            let rwlock = Arc::clone(current_proc.rwlock_list[rwlock_id].as_ref().unwrap());
+            let (tid, rwlock) = unsafe {
+                (*processor)
+                    .with_current_task_proc(|current, current_proc| {
+                        (
+                            current.tid,
+                            Arc::clone(current_proc.rwlock_list[rwlock_id].as_ref().unwrap()),
+                        )
+                    })
+                    .unwrap()
+            };
             if rwlock.try_write(tid) { 0 } else { -1 }
         }
 
         /// 释放读写锁，并唤醒等待线程
         fn rwlock_unlock(&self, _caller: Caller, rwlock_id: usize) -> isize {
             let processor: *mut ProcessorInner = PROCESSOR.get_mut() as *mut ProcessorInner;
-            let tid = unsafe { (*processor).current().unwrap().tid };
-            let current_proc = unsafe { (*processor).get_current_proc().unwrap() };
-            let rwlock = Arc::clone(current_proc.rwlock_list[rwlock_id].as_ref().unwrap());
+            let (tid, rwlock) = unsafe {
+                (*processor)
+                    .with_current_task_proc(|current, current_proc| {
+                        (
+                            current.tid,
+                            Arc::clone(current_proc.rwlock_list[rwlock_id].as_ref().unwrap()),
+                        )
+                    })
+                    .unwrap()
+            };
             for waking_tid in rwlock.unlock_for(tid) {
                 unsafe { (*processor).re_enque(waking_tid); }
             }

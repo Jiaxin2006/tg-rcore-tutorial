@@ -392,6 +392,16 @@ pub fn pipe(pipe_fd: &mut [usize]) -> isize {
     unsafe { syscall1(SyscallId::PIPE2, pipe_fd.as_mut_ptr() as _) }
 }
 
+/// 检查一次长 syscall 期间是否真的发生了内核态 timer interrupt。
+///
+/// 返回值语义：
+/// - `>= min_interrupts`：本次 syscall 期间至少观测到了这些内核态 timer interrupt
+/// - `< 0`：超时或内核未接入该测试接口
+#[inline]
+pub fn kernel_interrupt_check(min_interrupts: usize) -> isize {
+    unsafe { syscall1(SyscallId::KERNEL_INTERRUPT_CHECK, min_interrupts) }
+}
+
 /// 这个模块包含调用系统调用的最小封装，用户可以直接使用这些函数调用自定义的系统调用。
 ///
 /// # Safety

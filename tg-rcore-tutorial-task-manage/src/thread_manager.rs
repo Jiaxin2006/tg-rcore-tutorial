@@ -43,18 +43,20 @@ impl<P, T, MT: Manage<T, ThreadId> + Schedule<ThreadId>, MP: Manage<P, ProcId>>
             phantom_p: PhantomData::<P>,
         }
     }
+    /// 选择下一个线程，只记录 current，不把线程实体借用暴露到外层。
+    pub fn find_next_id(&mut self) -> Option<ThreadId> {
+        while let Some(id) = self.manager.as_mut().unwrap().fetch() {
+            if self.manager.as_mut().unwrap().get_mut(id).is_some() {
+                self.current = Some(id);
+                return Some(id);
+            }
+        }
+        None
+    }
     /// 找到下一个进程
     pub fn find_next(&mut self) -> Option<&mut T> {
-        if let Some(id) = self.manager.as_mut().unwrap().fetch() {
-            if let Some(task) = self.manager.as_mut().unwrap().get_mut(id) {
-                self.current = Some(id);
-                Some(task)
-            } else {
-                None
-            }
-        } else {
-            None
-        }
+        let id = self.find_next_id()?;
+        self.manager.as_mut().unwrap().get_mut(id)
     }
     /// 设置 manager
     pub fn set_manager(&mut self, manager: MT) {
@@ -117,10 +119,54 @@ impl<P, T, MT: Manage<T, ThreadId> + Schedule<ThreadId>, MP: Manage<P, ProcId>>
         let id = self.current.unwrap();
         self.manager.as_mut().unwrap().get_mut(id)
     }
+    /// 当前线程 ID。
+    #[inline]
+    pub fn current_tid(&self) -> Option<ThreadId> {
+        self.current
+    }
+    /// 当前线程所属进程 ID。
+    #[inline]
+    pub fn current_pid(&self) -> Option<ProcId> {
+        self.current
+            .and_then(|tid| self.tid2pid.get(&tid).copied())
+    }
     /// 获取某个线程
     #[inline]
     pub fn get_task(&mut self, id: ThreadId) -> Option<&mut T> {
         self.manager.as_mut().unwrap().get_mut(id)
+    }
+
+    /// 在一个短作用域内借用当前线程。
+    #[inline]
+    pub fn with_current_task<R>(&mut self, f: impl FnOnce(&mut T) -> R) -> Option<R> {
+        let tid = self.current?;
+        let task = self.manager.as_mut().unwrap().get_mut(tid)? as *mut T;
+        Some(unsafe { f(&mut *task) })
+    }
+
+    /// 在一个短作用域内借用当前进程。
+    #[inline]
+    pub fn with_current_proc<R>(&mut self, f: impl FnOnce(&mut P) -> R) -> Option<R> {
+        let tid = self.current?;
+        let pid = *self.tid2pid.get(&tid)?;
+        let proc = self.proc_manager.as_mut().unwrap().get_mut(pid)? as *mut P;
+        Some(unsafe { f(&mut *proc) })
+    }
+
+    /// 在一个短作用域内同时借用当前线程和所属进程。
+    ///
+    /// 线程对象与进程对象来自两个独立的管理器，因此这里将借用限制在闭包内，
+    /// 避免把两个 `&mut` 引用泄露到外层并跨越调度器状态更新。
+    #[inline]
+    pub fn with_current_task_proc<R>(
+        &mut self,
+        f: impl FnOnce(&mut T, &mut P) -> R,
+    ) -> Option<R> {
+        let tid = self.current?;
+        let pid = *self.tid2pid.get(&tid)?;
+        let task = self.manager.as_mut().unwrap().get_mut(tid)? as *mut T;
+        let proc = self.proc_manager.as_mut().unwrap().get_mut(pid)? as *mut P;
+        Some(unsafe { f(&mut *task, &mut *proc) })
     }
     /// 添加进程
     pub fn add_proc(&mut self, id: ProcId, proc: P, parent: ProcId) {
@@ -142,17 +188,26 @@ impl<P, T, MT: Manage<T, ThreadId> + Schedule<ThreadId>, MP: Manage<P, ProcId>>
         let current_rel = self.rel_map.remove(&id).unwrap();
         let parent_pid = current_rel.parent;
         let children = current_rel.children;
+        let init_pid = ProcId::from_usize(0);
         // 从父进程中删除当前进程
         if let Some(parent_rel) = self.rel_map.get_mut(&parent_pid) {
             parent_rel.del_child(id, exit_code);
         }
-        // 把当前进程的所有子进程转移到 0 号进程
+        // 把当前进程的所有子进程转移到 0 号进程。
+        // 如果当前删除的正是 0 号进程，或 0 号进程已经不存在，则保留原父进程，
+        // 避免在“孤儿收养者”不存在时再次触发 panic。
+        let orphan_parent = if id != init_pid && self.rel_map.contains_key(&init_pid) {
+            init_pid
+        } else {
+            parent_pid
+        };
         for i in children {
-            self.rel_map.get_mut(&i).unwrap().parent = ProcId::from_usize(0);
-            self.rel_map
-                .get_mut(&ProcId::from_usize(0))
-                .unwrap()
-                .add_child(i);
+            if let Some(child_rel) = self.rel_map.get_mut(&i) {
+                child_rel.parent = orphan_parent;
+            }
+            if let Some(orphan_rel) = self.rel_map.get_mut(&orphan_parent) {
+                orphan_rel.add_child(i);
+            }
         }
     }
     /// wait 系统调用，返回结束的子进程 id 和 exit_code，正在运行的子进程不返回 None，返回 (-2, -1)

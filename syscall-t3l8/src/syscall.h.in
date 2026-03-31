@@ -330,6 +330,7 @@
 #define __NR_fb_get_info 1040
 #define __NR_fb_present 1041
 #define __NR_input_getchar 1042
+#define __NR_kernel_interrupt_check 1043
 
 // #define __NR_sysriscv __NR_arch_specific_syscall
 // #define __NR_riscv_flush_icache (__NR_sysriscv + 15)

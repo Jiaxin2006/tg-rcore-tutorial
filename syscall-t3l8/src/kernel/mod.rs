@@ -204,6 +204,14 @@ pub trait Framebuffer: Sync {
     }
 }
 
+/// 内核实验辅助接口：用于验证特定内核机制是否生效。
+pub trait KernelTest: Sync {
+    /// 在一次长内核路径中检查是否真的收到了内核态 timer interrupt。
+    fn kernel_interrupt_check(&self, caller: Caller, min_interrupts: usize) -> isize {
+        unimplemented!()
+    }
+}
+
 static PROCESS: Container<dyn Process> = Container::new();
 static IO: Container<dyn IO> = Container::new();
 static MEMORY: Container<dyn Memory> = Container::new();
@@ -214,6 +222,7 @@ static THREAD: Container<dyn Thread> = Container::new();
 static SYNC_MUTEX: Container<dyn SyncMutex> = Container::new();
 static TRACE: Container<dyn Trace> = Container::new();
 static FRAMEBUFFER: Container<dyn Framebuffer> = Container::new();
+static KERNEL_TEST: Container<dyn KernelTest> = Container::new();
 
 #[inline]
 pub fn init_process(process: &'static dyn Process) {
@@ -263,6 +272,11 @@ pub fn init_trace(trace: &'static dyn Trace) {
 #[inline]
 pub fn init_framebuffer(framebuffer: &'static dyn Framebuffer) {
     FRAMEBUFFER.init(framebuffer);
+}
+
+#[inline]
+pub fn init_kernel_test(kernel_test: &'static dyn KernelTest) {
+    KERNEL_TEST.init(kernel_test);
 }
 
 pub enum SyscallResult {
@@ -368,6 +382,9 @@ pub fn handle(caller: Caller, id: SyscallId, args: [usize; 6]) -> SyscallResult 
         }
         Id::FB_PRESENT => {
             FRAMEBUFFER.call(id, |fb| fb.fb_present(caller, args[0], args[1]))
+        }
+        Id::KERNEL_INTERRUPT_CHECK => {
+            KERNEL_TEST.call(id, |test| test.kernel_interrupt_check(caller, args[0]))
         }
         _ => SyscallResult::Unsupported(id),
     }

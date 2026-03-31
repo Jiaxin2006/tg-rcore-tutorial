@@ -60,18 +60,25 @@ impl<P, MP: Manage<P, ProcId> + Schedule<ProcId>> PManager<P, MP> {
         let current_rel = self.rel_map.remove(&id).unwrap();
         let parent_pid = current_rel.parent;
         let children = current_rel.children;
+        let init_pid = ProcId::from_usize(0);
         // 从父进程中删除当前进程
         if let Some(parent_rel) = self.rel_map.get_mut(&parent_pid) {
             parent_rel.del_child(id, exit_code);
         }
         // 把当前进程的所有子进程转移到 0 号进程
         // 这对应了教学内核中的“孤儿进程托管”简化策略。
+        let orphan_parent = if id != init_pid && self.rel_map.contains_key(&init_pid) {
+            init_pid
+        } else {
+            parent_pid
+        };
         for i in children {
-            self.rel_map.get_mut(&i).unwrap().parent = ProcId::from_usize(0);
-            self.rel_map
-                .get_mut(&ProcId::from_usize(0))
-                .unwrap()
-                .add_child(i);
+            if let Some(child_rel) = self.rel_map.get_mut(&i) {
+                child_rel.parent = orphan_parent;
+            }
+            if let Some(orphan_rel) = self.rel_map.get_mut(&orphan_parent) {
+                orphan_rel.add_child(i);
+            }
         }
         self.current = None;
     }

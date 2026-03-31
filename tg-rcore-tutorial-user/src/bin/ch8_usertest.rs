@@ -27,6 +27,7 @@ const TESTS: &[&str] = &[
     "phil_din_mutex",
     "test_condvar",
     "pipetest",
+    "kernel_interrupt_check",
     "ch8_deadlock_mutex1",
     "ch8_deadlock_sem1",
     "ch8_deadlock_sem2",
@@ -54,6 +55,7 @@ extern "C" fn main() -> i32 {
     for (i, &test) in TESTS.iter().enumerate() {
         let wait_pid = waitpid(pids[i], &mut xstate);
         assert_eq!(pids[i], wait_pid);
+        assert_eq!(xstate, 0, "test {} failed with exit code {}", test, xstate);
         println!(
             "\x1b[32mUsertests: Test {} in Process {} exited with code {}\x1b[0m",
             test, pids[i], xstate
