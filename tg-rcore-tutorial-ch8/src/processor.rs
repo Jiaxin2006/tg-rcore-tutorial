@@ -19,15 +19,16 @@
 //! - 最后看 `Schedule<ThreadId>`：明确调度粒度已经从进程切换为线程。
 
 use crate::process::{Process, Thread};
+use alloc::boxed::Box;
 use alloc::collections::BTreeMap;
 use core::cell::UnsafeCell;
 use exp4_scheduler::DefaultTaskManager;
 use tg_task_manage::{Manage, PThreadManager, ProcId, ThreadId};
 
 /// 处理器内部类型（双层管理器）
-pub type ProcessorInner = PThreadManager<Process, Thread, ThreadManager, ProcManager>;
+pub type ProcessorInner = PThreadManager<Process, Box<Thread>, ThreadManager, ProcManager>;
 /// 默认线程管理器：底层由 `exp4-scheduler` 的 FCFS 兼容管理器提供。
-pub type ThreadManager = DefaultTaskManager<Thread, ThreadId>;
+pub type ThreadManager = DefaultTaskManager<Box<Thread>, ThreadId>;
 
 /// 全局处理器包装（通过 `UnsafeCell` 允许内部可变）
 pub struct Processor {

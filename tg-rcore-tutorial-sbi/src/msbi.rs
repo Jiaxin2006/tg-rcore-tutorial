@@ -9,11 +9,20 @@
 //! 设计定位：这是“够用即可”的教学最小实现，
 //! 只覆盖 ch1~ch8 需要的 SBI 功能，不追求完整 SBI 规范实现。
 
-use core::arch::asm;
+use core::{arch::asm, mem::size_of};
 
 const UART_BASE: usize = 0x1000_0000;
 // 说明：该地址是 QEMU virt 机器常用 UART MMIO 基址。
-// 本实现假定运行环境与教学配置一致（单核 + QEMU virt）。
+// 本实现假定运行环境与教学配置一致（QEMU virt）。
+
+#[inline]
+fn current_mhartid() -> usize {
+    let hart_id: usize;
+    unsafe {
+        asm!("csrr {}, mhartid", out(reg) hart_id);
+    }
+    hart_id
+}
 
 /// UART 操作（16550 兼容）。
 mod uart {
@@ -137,11 +146,13 @@ fn handle_console_getchar() -> SbiRet {
 
 /// 处理 Timer 扩展（EID 0x54494D45）。
 fn handle_timer(time: u64) -> SbiRet {
-    const CLINT_MTIMECMP: usize = 0x200_4000;
-    // SAFETY: 向 QEMU virt 机器的已知 MMIO 地址写入 CLINT mtimecmp 寄存器。
-    // 这将设置下一次定时器中断的触发时间。
+    const CLINT_MTIMECMP_BASE: usize = 0x200_4000;
+    let hart_id = current_mhartid();
+    let mtimecmp = CLINT_MTIMECMP_BASE + hart_id * size_of::<u64>();
+    // SAFETY: 向 QEMU virt 机器中“当前 hart 对应”的 CLINT mtimecmp 寄存器写入下一次 deadline。
+    // 在 SMP 下，每个 hart 都有独立的 mtimecmp 槽位，地址按 hart_id 递增 8 字节。
     unsafe {
-        (CLINT_MTIMECMP as *mut u64).write_volatile(time);
+        (mtimecmp as *mut u64).write_volatile(time);
     }
     // 清除挂起的 S-mode 定时器中断（STIP），避免“旧中断状态”干扰下一次调度。
     // SAFETY: 修改 mip CSR 以清除 STIP 位是有效的 M-mode 操作。

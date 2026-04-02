@@ -26,6 +26,8 @@ runner = [
     "cocoa",
     "-bios",
     "none",
+    "-smp",
+    "2",
     "-m",
     "128M",
     "-drive",

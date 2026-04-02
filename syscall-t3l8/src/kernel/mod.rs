@@ -210,6 +210,11 @@ pub trait KernelTest: Sync {
     fn kernel_interrupt_check(&self, caller: Caller, min_interrupts: usize) -> isize {
         unimplemented!()
     }
+
+    /// 导出当前 hart 局部状态快照，便于验证 SMP bring-up 和 per-hart timer。
+    fn kernel_hart_snapshot(&self, caller: Caller, out_ptr: usize, out_len: usize) -> isize {
+        unimplemented!()
+    }
 }
 
 static PROCESS: Container<dyn Process> = Container::new();
@@ -307,7 +312,9 @@ pub fn handle(caller: Caller, id: SyscallId, args: [usize; 6]) -> SyscallResult 
             io.unlinkat(caller, args[0] as _, args[1], args[2] as _)
         }),
         Id::FSTAT => IO.call(id, |io| io.fstat(caller, args[0], args[1])),
-        Id::LSEEK => IO.call(id, |io| io.lseek(caller, args[0], args[1] as isize, args[2])),
+        Id::LSEEK => IO.call(id, |io| {
+            io.lseek(caller, args[0], args[1] as isize, args[2])
+        }),
         Id::EXIT => PROCESS.call(id, |proc| proc.exit(caller, args[0])),
         Id::CLONE => PROCESS.call(id, |proc| proc.fork(caller)),
         Id::EXECVE => PROCESS.call(id, |proc| proc.exec(caller, args[0], args[1])),
@@ -359,12 +366,12 @@ pub fn handle(caller: Caller, id: SyscallId, args: [usize; 6]) -> SyscallResult 
             sync_mutex.condvar_wait(caller, args[0], args[1])
         }),
         Id::RWLOCK_CREATE => SYNC_MUTEX.call(id, |sync_mutex| sync_mutex.rwlock_create(caller)),
-        Id::RWLOCK_READ_LOCK => {
-            SYNC_MUTEX.call(id, |sync_mutex| sync_mutex.rwlock_read_lock(caller, args[0]))
-        }
-        Id::RWLOCK_WRITE_LOCK => {
-            SYNC_MUTEX.call(id, |sync_mutex| sync_mutex.rwlock_write_lock(caller, args[0]))
-        }
+        Id::RWLOCK_READ_LOCK => SYNC_MUTEX.call(id, |sync_mutex| {
+            sync_mutex.rwlock_read_lock(caller, args[0])
+        }),
+        Id::RWLOCK_WRITE_LOCK => SYNC_MUTEX.call(id, |sync_mutex| {
+            sync_mutex.rwlock_write_lock(caller, args[0])
+        }),
         Id::RWLOCK_UNLOCK => {
             SYNC_MUTEX.call(id, |sync_mutex| sync_mutex.rwlock_unlock(caller, args[0]))
         }
@@ -377,15 +384,14 @@ pub fn handle(caller: Caller, id: SyscallId, args: [usize; 6]) -> SyscallResult 
         Id::BRK => PROCESS.call(id, |proc| proc.sbrk(caller, args[0] as _)),
         Id::PIPE2 => IO.call(id, |io| io.pipe(caller, args[0])),
         Id::INPUT_GETCHAR => IO.call(id, |io| io.input_getchar(caller)),
-        Id::FB_GET_INFO => {
-            FRAMEBUFFER.call(id, |fb| fb.fb_get_info(caller, args[0]))
-        }
-        Id::FB_PRESENT => {
-            FRAMEBUFFER.call(id, |fb| fb.fb_present(caller, args[0], args[1]))
-        }
+        Id::FB_GET_INFO => FRAMEBUFFER.call(id, |fb| fb.fb_get_info(caller, args[0])),
+        Id::FB_PRESENT => FRAMEBUFFER.call(id, |fb| fb.fb_present(caller, args[0], args[1])),
         Id::KERNEL_INTERRUPT_CHECK => {
             KERNEL_TEST.call(id, |test| test.kernel_interrupt_check(caller, args[0]))
         }
+        Id::KERNEL_HART_SNAPSHOT => KERNEL_TEST.call(id, |test| {
+            test.kernel_hart_snapshot(caller, args[0], args[1])
+        }),
         _ => SyscallResult::Unsupported(id),
     }
 }

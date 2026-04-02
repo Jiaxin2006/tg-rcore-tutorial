@@ -18,7 +18,7 @@ include!(concat!(env!("OUT_DIR"), "/syscalls.rs"));
 
 pub use fs::*;
 pub use io::*;
-pub use tg_signal_defs::{SignalAction, SignalNo, MAX_SIG};
+pub use tg_signal_defs::{MAX_SIG, SignalAction, SignalNo};
 pub use time::*;
 
 #[cfg(feature = "user")]
@@ -45,4 +45,27 @@ impl From<usize> for SyscallId {
     fn from(val: usize) -> Self {
         Self(val)
     }
+}
+
+/// 当前 SMP 调试接口一次最多暴露的 hart 数量。
+pub const SMP_HART_CAPACITY: usize = 8;
+
+/// 内核导出的多核本地状态快照。
+#[derive(Clone, Copy, Debug, Default)]
+#[repr(C)]
+pub struct HartSnapshot {
+    /// 内核编译时支持的最大 hart 数。
+    pub max_harts: usize,
+    /// 当前已经完成 bring-up 的 hart 数。
+    pub online_harts: usize,
+    /// online hart 的位图，bit i 表示 hart i 已上线。
+    pub online_mask: usize,
+    /// 发起这次 syscall 的 hart id。
+    pub current_hart: usize,
+    /// 当前被置位 `need_resched` 的 hart 位图。
+    pub need_resched_mask: usize,
+    /// 每个 hart 的逻辑 tick 计数。
+    pub timer_ticks: [u64; SMP_HART_CAPACITY],
+    /// 每个 hart 在 S 态内核代码里实际收到的 timer interrupt 次数。
+    pub kernel_timer_interrupts: [u64; SMP_HART_CAPACITY],
 }

@@ -384,11 +384,11 @@ WAD 里实际存在的是 `STCFN033`。真正的问题是我自己实现的 `snp
 
 1. 启动模式开关  
 - `initproc` 的默认启动目标改成了 `doomgeneric`，因此 `cargo run` 时会默认直接进入 Doom，而不是先停在 shell。
-- `doomgeneric` 默认构建为**无交互 demo 模式**：`make -f Makefile.rcore` 会把参数固定为 `-iwad doom1.wad -playdemo demo1`，便于优先验证显示链路。
-- 若要测试键盘交互，可改用 `make -f Makefile.rcore DG_MODE=interactive` 重新编译 Doom，再执行 `cargo build` / `cargo run` 重新打包镜像。
+- 该结论后来已经更新：当前 `doomgeneric` 默认构建为**可交互版本**，`make -f Makefile.rcore` 会直接生成 `DG_MODE=interactive` 的二进制，默认参数只包含 `-iwad doom1.wad`。
+- 如果需要回到强制自动播放 `demo1` 的版本，可显式执行 `make -f Makefile.rcore DG_MODE=demo`，再执行 `cargo build` / `cargo run` 重新打包镜像。
 
 2. 这次进一步确认到的事实  
-- 在 `-display none` 的无窗口 QEMU 启动中，串口日志已经能稳定看到 `[doomgeneric] mode=demo (-playdemo demo1)`，说明 Doom 的自动 demo 模式确实已经生效。
+- 在当前交互版启动中，串口日志会打印 `[doomgeneric] mode=interactive (keyboard from cargo run terminal)`，说明此时并不是强制 `-playdemo demo1` 的 demo 构建。
 - 同时内核日志也能看到 `virtio-gpu: first present ... opaque_sample=1024/1024`，说明用户态第一帧已经成功提交到 VirtIO-GPU，且 alpha 不为 0，不是“应用根本没出图”。
 
 3. 新结论  

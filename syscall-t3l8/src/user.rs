@@ -358,6 +358,8 @@ pub fn rwlock_unlock(rwlock_id: usize) -> isize {
     unsafe { syscall1(SyscallId::RWLOCK_UNLOCK, rwlock_id) }
 }
 
+use crate::HartSnapshot;
+
 /// 启用死锁检测。
 #[inline]
 pub fn enable_deadlock_detect(is_enable: bool) -> isize {
@@ -400,6 +402,22 @@ pub fn pipe(pipe_fd: &mut [usize]) -> isize {
 #[inline]
 pub fn kernel_interrupt_check(min_interrupts: usize) -> isize {
     unsafe { syscall1(SyscallId::KERNEL_INTERRUPT_CHECK, min_interrupts) }
+}
+
+/// 读取当前内核导出的多核本地状态快照。
+///
+/// 返回值语义：
+/// - `>= 0`：成功，通常返回当前 online hart 的数量
+/// - `< 0`：内核未接入该测试接口，或用户缓冲区无效
+#[inline]
+pub fn kernel_hart_snapshot(snapshot: &mut HartSnapshot) -> isize {
+    unsafe {
+        syscall2(
+            SyscallId::KERNEL_HART_SNAPSHOT,
+            snapshot as *mut _ as usize,
+            core::mem::size_of::<HartSnapshot>(),
+        )
+    }
 }
 
 /// 这个模块包含调用系统调用的最小封装，用户可以直接使用这些函数调用自定义的系统调用。

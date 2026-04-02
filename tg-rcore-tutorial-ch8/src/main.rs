@@ -63,11 +63,17 @@ mod virtio_gpu {
     pub const DOOM_FB_H: usize = 400;
     pub const DOOM_FB_BYTES: usize = DOOM_FB_W * DOOM_FB_H * 4;
     #[inline]
-    pub fn init() -> Result<(), ()> { Err(()) }
+    pub fn init() -> Result<(), ()> {
+        Err(())
+    }
     #[inline]
-    pub fn dimensions() -> Option<(u32, u32, u32)> { None }
+    pub fn dimensions() -> Option<(u32, u32, u32)> {
+        None
+    }
     #[inline]
-    pub fn present(_: &[u8]) -> Result<(), ()> { Err(()) }
+    pub fn present(_: &[u8]) -> Result<(), ()> {
+        Err(())
+    }
 }
 
 #[macro_use]
@@ -77,17 +83,18 @@ extern crate tg_console;
 extern crate alloc;
 
 use crate::{
-    fs::{read_all, FS},
+    fs::{FS, read_all},
     impls::{Sv39Manager, SyscallContext},
     process::{Process, Thread},
     processor::{ProcManager, ProcessorInner, ThreadManager},
 };
 use alloc::alloc::alloc;
+use alloc::boxed::Box;
 use core::{
     alloc::Layout,
     cell::UnsafeCell,
     mem::MaybeUninit,
-    sync::atomic::{AtomicBool, AtomicU64, Ordering},
+    sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering},
 };
 use impls::Console;
 pub use processor::PROCESSOR;
@@ -100,8 +107,8 @@ use tg_kernel_context::foreign::MultislotPortal;
 #[cfg(target_arch = "riscv64")]
 use tg_kernel_vm::page_table::Sv39;
 use tg_kernel_vm::{
-    page_table::{MmuMeta, VAddr, VmFlags, VmMeta, PPN, VPN},
     AddressSpace,
+    page_table::{MmuMeta, PPN, VAddr, VPN, VmFlags, VmMeta},
 };
 use tg_sbi;
 use tg_signal::SignalResult;
@@ -124,6 +131,9 @@ fn parse_flags(s: &str) -> Result<VmFlags<Sv39>, ()> {
 #[cfg(not(target_arch = "riscv64"))]
 use stub::{build_flags, parse_flags};
 
+const MAX_HARTS: usize = tg_syscall::SMP_HART_CAPACITY;
+const BOOT_HART_ID: usize = 0;
+
 // 内核入口，栈 = 32 页 = 128 KiB。
 //
 // 这里不再调用 tg_linker::boot0! 宏，避免外部已发布版本与 Rust 2024
@@ -135,10 +145,15 @@ use stub::{build_flags, parse_flags};
 unsafe extern "C" fn _start() -> ! {
     const STACK_SIZE: usize = 32 * 4096;
     #[unsafe(link_section = ".boot.stack")]
-    static mut STACK: [u8; STACK_SIZE] = [0u8; STACK_SIZE];
+    static mut STACK: [u8; STACK_SIZE * MAX_HARTS] = [0u8; STACK_SIZE * MAX_HARTS];
 
     core::arch::naked_asm!(
-        "la sp, {stack} + {stack_size}",
+        "mv tp, a0",
+        "la sp, {stack}",
+        "li t0, {stack_size}",
+        "addi t1, a0, 1",
+        "mul t1, t1, t0",
+        "add sp, sp, t1",
         "j  {main}",
         stack = sym STACK,
         stack_size = const STACK_SIZE,
@@ -177,24 +192,132 @@ impl KernelSpace {
 /// 内核地址空间全局实例
 static KERNEL_SPACE: KernelSpace = KernelSpace::new();
 
-/// VirtIO-MMIO 区域（8 个 slot：块设备、GPU 等）
-pub const MMIO: &[(usize, usize)] = &[(0x1000_1000, 0x8000)];
+/// MMIO 区域：
+/// - UART 16550：0x1000_0000
+/// - VirtIO-MMIO slots：0x1000_1000..0x1000_9000
+pub const MMIO: &[(usize, usize)] = &[(0x1000_0000, 0x1000), (0x1000_1000, 0x8000)];
 /// 单次时间片长度（与 ch3 保持一致）。
-const TIMER_INTERVAL: u64 = 12_500;
-/// 延迟调度标记：中断上下文只置位，安全点再真正切换。
-static NEED_RESCHED: AtomicBool = AtomicBool::new(false);
-/// 统一的逻辑 tick 计数。
-static TIMER_TICKS: AtomicU64 = AtomicU64::new(0);
-/// 在 S 态内核代码中实际接收到的时钟中断次数。
-static KERNEL_TIMER_INTERRUPTS: AtomicU64 = AtomicU64::new(0);
-/// 仅用于调试：避免在每次内核态 timer 到来时刷屏。
-static KERNEL_TIMER_LOGGED: AtomicBool = AtomicBool::new(false);
-/// 避免内核态非 timer 中断刷屏。
-static KERNEL_OTHER_INTERRUPT_LOGGED: AtomicBool = AtomicBool::new(false);
+const TIMER_INTERVAL: u64 = 62_500;
 /// 仅调试关键 syscall 路径，避免日志过量影响时序。
 static DEBUG_SYSCALL_LOGGED: AtomicBool = AtomicBool::new(false);
 /// 限制调度日志数量，避免刷屏影响时序。
 static DEBUG_SCHEDULE_LOGS: AtomicU64 = AtomicU64::new(0);
+/// 当前已经进入 S 态并完成本核 bring-up 的 hart 数量。
+static ONLINE_HARTS: AtomicUsize = AtomicUsize::new(0);
+/// online hart 的位图，bit i 表示 hart i 已经完成 bring-up。
+static ONLINE_HART_MASK: AtomicUsize = AtomicUsize::new(0);
+/// boot hart 完成一次性全局初始化后，放行次核进入 S 态。
+#[cfg(target_arch = "riscv64")]
+#[unsafe(no_mangle)]
+#[unsafe(link_section = ".data")]
+static SECONDARY_BOOT_READY: AtomicUsize = AtomicUsize::new(0);
+/// 第一版 SMP 保护：所有共享内核状态先由一把全局大锁串行化。
+static KERNEL_BIG_LOCK: spin::Mutex<()> = spin::Mutex::new(());
+
+/// 每个 hart 的本地运行状态。
+struct HartLocalState {
+    need_resched: AtomicBool,
+    timer_ticks: AtomicU64,
+    kernel_timer_interrupts: AtomicU64,
+    kernel_timer_logged: AtomicBool,
+    kernel_other_interrupt_logged: AtomicBool,
+}
+
+impl HartLocalState {
+    const fn new() -> Self {
+        Self {
+            need_resched: AtomicBool::new(false),
+            timer_ticks: AtomicU64::new(0),
+            kernel_timer_interrupts: AtomicU64::new(0),
+            kernel_timer_logged: AtomicBool::new(false),
+            kernel_other_interrupt_logged: AtomicBool::new(false),
+        }
+    }
+}
+
+static HART_LOCAL: [HartLocalState; MAX_HARTS] = [
+    HartLocalState::new(),
+    HartLocalState::new(),
+    HartLocalState::new(),
+    HartLocalState::new(),
+    HartLocalState::new(),
+    HartLocalState::new(),
+    HartLocalState::new(),
+    HartLocalState::new(),
+];
+
+#[cfg(target_arch = "riscv64")]
+#[inline]
+fn current_hart_id() -> usize {
+    let hart_id: usize;
+    unsafe { core::arch::asm!("mv {}, tp", out(reg) hart_id) };
+    hart_id
+}
+
+#[cfg(not(target_arch = "riscv64"))]
+#[inline]
+fn current_hart_id() -> usize {
+    0
+}
+
+#[inline]
+fn shared_portal_ptr() -> *mut MultislotPortal {
+    PROTAL_TRANSIT.base().val() as *mut MultislotPortal
+}
+
+#[inline]
+fn hart_local_by_id(hart_id: usize) -> &'static HartLocalState {
+    assert!(
+        hart_id < MAX_HARTS,
+        "hart{hart_id} exceeds MAX_HARTS={MAX_HARTS}"
+    );
+    &HART_LOCAL[hart_id]
+}
+
+#[inline]
+fn hart_local() -> &'static HartLocalState {
+    hart_local_by_id(current_hart_id())
+}
+
+#[cfg(target_arch = "riscv64")]
+#[inline]
+fn activate_kernel_address_space() {
+    let root_ppn = unsafe { KERNEL_SPACE.assume_init_ref() }.root_ppn().val();
+    unsafe {
+        satp::set(satp::Mode::Sv39, 0, root_ppn);
+        core::arch::asm!("sfence.vma");
+    }
+}
+
+#[cfg(not(target_arch = "riscv64"))]
+#[inline]
+fn activate_kernel_address_space() {}
+
+#[inline]
+fn mark_hart_online(hart_id: usize, role: &str) {
+    ONLINE_HART_MASK.fetch_or(1usize << hart_id, Ordering::SeqCst);
+    let online = ONLINE_HARTS.fetch_add(1, Ordering::SeqCst) + 1;
+    log::info!("hart{hart_id} online ({role}), online_harts={online}");
+}
+
+#[inline]
+fn fill_hart_snapshot(snapshot: &mut tg_syscall::HartSnapshot) {
+    snapshot.max_harts = MAX_HARTS;
+    snapshot.online_harts = ONLINE_HARTS.load(Ordering::SeqCst);
+    snapshot.online_mask = ONLINE_HART_MASK.load(Ordering::SeqCst);
+    snapshot.current_hart = current_hart_id();
+    snapshot.need_resched_mask = 0;
+    for hart_id in 0..MAX_HARTS {
+        let local = hart_local_by_id(hart_id);
+        if local.need_resched.load(Ordering::SeqCst) {
+            snapshot.need_resched_mask |= 1usize << hart_id;
+        }
+        snapshot.timer_ticks[hart_id] = local.timer_ticks.load(Ordering::SeqCst);
+        snapshot.kernel_timer_interrupts[hart_id] =
+            local.kernel_timer_interrupts.load(Ordering::SeqCst);
+    }
+}
+
 #[inline]
 fn program_next_timer() {
     #[cfg(target_arch = "riscv64")]
@@ -203,20 +326,36 @@ fn program_next_timer() {
 
 #[inline]
 fn record_timer_tick() {
-    TIMER_TICKS.fetch_add(1, Ordering::SeqCst);
-    NEED_RESCHED.store(true, Ordering::SeqCst);
+    let local = hart_local();
+    local.timer_ticks.fetch_add(1, Ordering::SeqCst);
+    local.need_resched.store(true, Ordering::SeqCst);
     program_next_timer();
 }
 
 #[inline]
 fn take_need_resched() -> bool {
-    NEED_RESCHED.swap(false, Ordering::SeqCst)
+    hart_local().need_resched.swap(false, Ordering::SeqCst)
+}
+
+#[inline]
+fn current_timer_ticks() -> u64 {
+    hart_local().timer_ticks.load(Ordering::SeqCst)
+}
+
+#[inline]
+fn current_kernel_timer_interrupts() -> u64 {
+    hart_local().kernel_timer_interrupts.load(Ordering::SeqCst)
 }
 
 #[cfg(target_arch = "riscv64")]
 #[inline]
 fn install_kernel_trap() {
-    unsafe { stvec::write(kernel_trap_entry as *const () as usize, stvec::TrapMode::Direct) };
+    unsafe {
+        stvec::write(
+            kernel_trap_entry as *const () as usize,
+            stvec::TrapMode::Direct,
+        )
+    };
 }
 
 #[cfg(not(target_arch = "riscv64"))]
@@ -253,7 +392,9 @@ impl KernelInterruptGuard {
         }
         #[cfg(not(target_arch = "riscv64"))]
         {
-            Self { enabled_before: false }
+            Self {
+                enabled_before: false,
+            }
         }
     }
 }
@@ -276,27 +417,38 @@ impl Drop for KernelInterruptGuard {
 #[cfg(target_arch = "riscv64")]
 extern "C" fn kernel_trap_handler() {
     use scause::{Interrupt, Trap};
+    let hart_id = current_hart_id();
+    let local = hart_local();
 
     match scause::read().cause() {
         Trap::Interrupt(Interrupt::SupervisorTimer) => {
-            if !KERNEL_TIMER_LOGGED.swap(true, Ordering::SeqCst) {
-                log::info!("kernel timer interrupt observed");
+            if !local.kernel_timer_logged.swap(true, Ordering::SeqCst) {
+                log::debug!("hart{hart_id} kernel timer interrupt observed");
             }
-            KERNEL_TIMER_INTERRUPTS.fetch_add(1, Ordering::SeqCst);
+            local.kernel_timer_interrupts.fetch_add(1, Ordering::SeqCst);
             record_timer_tick();
         }
         Trap::Interrupt(cause) => {
             let sepc = sepc::read();
             let stval = stval::read();
-            if !KERNEL_OTHER_INTERRUPT_LOGGED.swap(true, Ordering::SeqCst) {
-                log::warn!("unexpected kernel interrupt: {cause:?} sepc={sepc:#x} stval={stval:#x}");
+            if !local
+                .kernel_other_interrupt_logged
+                .swap(true, Ordering::SeqCst)
+            {
+                log::warn!(
+                    "unexpected kernel interrupt on hart{hart_id}: {cause:?} sepc={sepc:#x} stval={stval:#x}"
+                );
             }
-            panic!("unexpected kernel interrupt: {cause:?} sepc={sepc:#x} stval={stval:#x}");
+            panic!(
+                "unexpected kernel interrupt on hart{hart_id}: {cause:?} sepc={sepc:#x} stval={stval:#x}"
+            );
         }
         cause => {
             let sepc = sepc::read();
             let stval = stval::read();
-            panic!("unexpected kernel exception: {cause:?} sepc={sepc:#x} stval={stval:#x}");
+            panic!(
+                "unexpected kernel exception on hart{hart_id}: {cause:?} sepc={sepc:#x} stval={stval:#x}"
+            );
         }
     }
 }
@@ -353,14 +505,259 @@ unsafe extern "C" fn kernel_trap_entry() {
 /// - 使用 `PThreadManager`（双层管理器）替代 `PManager`
 /// - 初始化时同时创建 Process 和 Thread
 /// - 主循环中新增**线程阻塞**处理（SEMAPHORE_DOWN/MUTEX_LOCK/CONDVAR_WAIT）
-extern "C" fn rust_main() -> ! {
+fn rust_main_secondary(hart_id: usize) -> ! {
+    debug_assert_eq!(hart_id, current_hart_id());
+    activate_kernel_address_space();
+    mark_hart_online(hart_id, "secondary");
+    program_next_timer();
+    log::debug!("hart{hart_id} local timer armed");
+    #[cfg(target_arch = "riscv64")]
+    unsafe {
+        sie::set_stimer();
+    }
+    scheduler_loop()
+}
+
+#[inline]
+fn has_running_threads_elsewhere(processor: *mut ProcessorInner, hart_id: usize) -> bool {
+    unsafe { (*processor).has_running_threads_other_than(hart_id) }
+}
+
+#[inline]
+fn wait_for_work() {
+    let _ = take_need_resched();
+    #[cfg(target_arch = "riscv64")]
+    unsafe {
+        install_kernel_trap();
+        sie::set_stimer();
+        sstatus::set_sie();
+        core::arch::asm!("wfi");
+        sstatus::clear_sie();
+    }
+    #[cfg(not(target_arch = "riscv64"))]
+    core::hint::spin_loop();
+}
+
+#[inline]
+unsafe fn execute_current_on_hart(
+    processor: *mut ProcessorInner,
+    hart_id: usize,
+) {
+    let task = unsafe {
+        (*processor)
+            .with_current_task_for(hart_id, |task| &mut **task as *mut Thread)
+            .unwrap()
+    };
+    // SAFETY:
+    // - 调度器保证同一时刻一个线程只会出现在一个 hart 的 current 槽里；
+    // - 共享 portal 预留了按 hart 划分的 slot，执行时使用 `hart_id` 作为 slot key，
+    //   因此不同 hart 只会写各自的 PortalCache；
+    // - 这里在释放大内核锁后进入用户态，使多个 hart 可以并行执行用户线程，
+    //   但重新进入内核后仍会先争用同一把锁，先保证共享内核状态正确。
+    unsafe {
+        (*task).context.execute(&mut *shared_portal_ptr(), hart_id);
+    }
+}
+
+fn scheduler_loop() -> ! {
+    loop {
+        let hart_id = current_hart_id();
+        let processor: *mut ProcessorInner = PROCESSOR.get_mut() as *mut ProcessorInner;
+        let mut kernel_lock = KERNEL_BIG_LOCK.lock();
+        if let Some(_tid) = unsafe { (*processor).find_next_id_for(hart_id) } {
+            let schedule_log_index = DEBUG_SCHEDULE_LOGS.fetch_add(1, Ordering::SeqCst);
+            if schedule_log_index < 24 {
+                let (tid, pc, sp, ra) = unsafe {
+                    (*processor)
+                        .with_current_task_for(hart_id, |task| {
+                            (
+                                task.tid,
+                                task.context.context.pc(),
+                                task.context.context.sp(),
+                                task.context.context.ra(),
+                            )
+                        })
+                        .unwrap()
+                };
+                log::debug!(
+                    "schedule: hart{hart_id} tid={tid:?} pc={pc:#x} sp={sp:#x} ra={ra:#x}"
+                );
+            }
+            drop(kernel_lock);
+            unsafe { execute_current_on_hart(processor, hart_id) };
+            kernel_lock = KERNEL_BIG_LOCK.lock();
+            let cause = scause::read().cause();
+            match cause {
+                scause::Trap::Interrupt(scause::Interrupt::SupervisorTimer) => {
+                    record_timer_tick();
+                    if take_need_resched() {
+                        unsafe { (*processor).make_current_suspend_for(hart_id) };
+                    }
+                }
+                scause::Trap::Exception(scause::Exception::UserEnvCall) => {
+                    use tg_syscall::{SyscallId as Id, SyscallResult as Ret};
+                    let (id, args, sepc_before) = unsafe {
+                        (*processor)
+                            .with_current_task_for(hart_id, |task| {
+                                let ctx = &mut task.context.context;
+                                let sepc_before = ctx.pc();
+                                ctx.move_next();
+                                (
+                                    ctx.a(7).into(),
+                                    [ctx.a(0), ctx.a(1), ctx.a(2), ctx.a(3), ctx.a(4), ctx.a(5)],
+                                    sepc_before,
+                                )
+                            })
+                            .unwrap()
+                    };
+                    if matches!(
+                        id,
+                        Id::CLOCK_GETTIME
+                            | Id::KERNEL_INTERRUPT_CHECK
+                            | Id::KERNEL_HART_SNAPSHOT
+                            | Id::EXIT
+                            | Id::CLONE
+                            | Id::WAIT4
+                            | Id::EXECVE
+                    ) {
+                        log::debug!(
+                            "syscall enter: hart{hart_id} id={id:?} sepc={sepc_before:#x} a0={:#x} a1={:#x}",
+                            args[0],
+                            args[1],
+                        );
+                    } else if !DEBUG_SYSCALL_LOGGED.swap(true, Ordering::SeqCst) {
+                        log::debug!(
+                            "first non-debug syscall seen: hart{hart_id} id={id:?} sepc={sepc_before:#x}"
+                        );
+                    }
+                    let syscall_ret = tg_syscall::handle(Caller { entity: 0, flow: 0 }, id, args);
+                    if matches!(
+                        id,
+                        Id::CLOCK_GETTIME
+                            | Id::KERNEL_INTERRUPT_CHECK
+                            | Id::KERNEL_HART_SNAPSHOT
+                            | Id::EXIT
+                            | Id::CLONE
+                            | Id::WAIT4
+                            | Id::EXECVE
+                    ) {
+                        match syscall_ret {
+                            Ret::Done(ret) => {
+                                log::debug!("syscall return: hart{hart_id} id={id:?} ret={ret}")
+                            }
+                            Ret::Unsupported(unsupported) => {
+                                log::debug!(
+                                    "syscall return: hart{hart_id} id={id:?} unsupported={unsupported:?}"
+                                );
+                            }
+                        }
+                    }
+
+                    let signal_result = unsafe {
+                        (*processor)
+                            .with_current_task_proc_for(hart_id, |task, current_proc| {
+                                current_proc
+                                    .signal
+                                    .handle_signals(&mut task.context.context)
+                            })
+                            .unwrap()
+                    };
+                    match signal_result {
+                        SignalResult::ProcessKilled(exit_code) => unsafe {
+                            (*processor).make_current_exited_for(hart_id, exit_code as _)
+                        },
+                        _ => match syscall_ret {
+                            Ret::Done(ret) => match id {
+                                Id::EXIT => unsafe { (*processor).make_current_exited_for(hart_id, ret) },
+                                Id::SEMAPHORE_DOWN
+                                | Id::CONDVAR_WAIT
+                                | Id::RWLOCK_READ_LOCK
+                                | Id::RWLOCK_WRITE_LOCK => {
+                                    unsafe {
+                                        (*processor)
+                                            .with_current_task_for(hart_id, |task| {
+                                                *task.context.context.a_mut(0) = ret as _;
+                                            })
+                                            .unwrap();
+                                    }
+                                    if ret == -1 {
+                                        unsafe { (*processor).make_current_blocked_for(hart_id) };
+                                    } else {
+                                        unsafe { (*processor).make_current_suspend_for(hart_id) };
+                                    }
+                                }
+                                Id::MUTEX_LOCK => {
+                                    unsafe {
+                                        (*processor)
+                                            .with_current_task_for(hart_id, |task| {
+                                                *task.context.context.a_mut(0) = ret as _;
+                                            })
+                                            .unwrap();
+                                    }
+                                    if ret == -1 {
+                                        unsafe { (*processor).make_current_blocked_for(hart_id) };
+                                    } else {
+                                        unsafe { (*processor).make_current_suspend_for(hart_id) };
+                                    }
+                                }
+                                _ => {
+                                    unsafe {
+                                        (*processor)
+                                            .with_current_task_for(hart_id, |task| {
+                                                *task.context.context.a_mut(0) = ret as _;
+                                            })
+                                            .unwrap();
+                                    }
+                                    unsafe { (*processor).make_current_suspend_for(hart_id) };
+                                }
+                            },
+                            Ret::Unsupported(_) => {
+                                log::info!("id = {id:?}");
+                                unsafe { (*processor).make_current_exited_for(hart_id, -2) };
+                            }
+                        },
+                    }
+                }
+                e => {
+                    let sepc = riscv::register::sepc::read();
+                    let stval = riscv::register::stval::read();
+                    log::error!("unsupported trap on hart{hart_id}: {e:?} sepc={sepc:#x} stval={stval:#x}");
+                    unsafe { (*processor).make_current_exited_for(hart_id, -3) };
+                }
+            }
+        } else {
+            let no_running_threads = !unsafe { (*processor).has_running_threads() };
+            drop(kernel_lock);
+            if no_running_threads {
+                if hart_id == BOOT_HART_ID {
+                    println!("no task");
+                    tg_sbi::shutdown(false);
+                }
+                loop {
+                    wait_for_work();
+                }
+            }
+            if !has_running_threads_elsewhere(processor, hart_id) {
+                core::hint::spin_loop();
+            }
+            wait_for_work();
+        }
+    }
+}
+
+extern "C" fn rust_main(hart_id: usize) -> ! {
+    debug_assert_eq!(hart_id, current_hart_id());
+    if hart_id != BOOT_HART_ID {
+        rust_main_secondary(hart_id);
+    }
+
     let layout = tg_linker::KernelLayout::locate();
     // 步骤 1：BSS 清零
     unsafe { layout.zero_bss() };
     // 步骤 2：控制台和日志
     tg_console::init_console(&Console);
-    tg_console::set_log_level(option_env!("LOG"));
-    tg_console::test_log();
+    tg_console::set_log_level(option_env!("LOG").or(Some("info")));
+    mark_hart_online(hart_id, "boot");
     // 步骤 3：堆分配器
     tg_kernel_alloc::init(layout.start() as _);
     unsafe {
@@ -370,23 +767,23 @@ extern "C" fn rust_main() -> ! {
         ))
     };
     // 步骤 4：异界传送门
-    let portal_size = MultislotPortal::calculate_size(1);
+    let portal_size = MultislotPortal::calculate_size(MAX_HARTS);
     let portal_layout = Layout::from_size_align(portal_size, 1 << Sv39::PAGE_BITS).unwrap();
     let portal_ptr = unsafe { alloc(portal_layout) };
     assert!(portal_layout.size() < 1 << Sv39::PAGE_BITS);
     // 步骤 5：内核地址空间
     kernel_space(layout, MEMORY, portal_ptr as _);
     // 步骤 6：异界传送门初始化
-    let portal = unsafe { MultislotPortal::init_transit(PROTAL_TRANSIT.base().val(), 1) };
+    let _portal = unsafe { MultislotPortal::init_transit(PROTAL_TRANSIT.base().val(), MAX_HARTS) };
     // 步骤 7：系统调用初始化
     tg_syscall::init_io(&SyscallContext);
     tg_syscall::init_process(&SyscallContext);
     tg_syscall::init_scheduling(&SyscallContext);
     tg_syscall::init_clock(&SyscallContext);
     tg_syscall::init_signal(&SyscallContext);
-    tg_syscall::init_thread(&SyscallContext);       // 本章新增：线程系统调用
-    tg_syscall::init_sync_mutex(&SyscallContext);   // 本章新增：同步原语系统调用
-    tg_syscall::init_kernel_test(&SyscallContext);  // T4 新增：内核态中断检查接口
+    tg_syscall::init_thread(&SyscallContext); // 本章新增：线程系统调用
+    tg_syscall::init_sync_mutex(&SyscallContext); // 本章新增：同步原语系统调用
+    tg_syscall::init_kernel_test(&SyscallContext); // T4 新增：内核态中断检查接口
     // 步骤 7b：VirtIO-GPU 帧缓冲（可选，供 doomgeneric / fb_demo）
     match crate::virtio_gpu::init() {
         Ok(()) => log::info!("virtio-gpu: framebuffer initialized"),
@@ -406,177 +803,17 @@ extern "C" fn rust_main() -> ! {
         PROCESSOR
             .get_mut()
             .add_proc(pid, process, ProcId::from_usize(usize::MAX));
-        PROCESSOR.get_mut().add(tid, thread, pid);
+        PROCESSOR.get_mut().add(tid, Box::new(thread), pid);
     }
     unsafe { sie::set_stimer() };
     program_next_timer();
-
-    // ─── 主调度循环 ───
-    loop {
-        let processor: *mut ProcessorInner = PROCESSOR.get_mut() as *mut ProcessorInner;
-        if let Some(_tid) = unsafe { (*processor).find_next_id() } {
-            // 不把 `&mut task` 从调度器直接泄露到外层，避免主循环把线程借用
-            // 跨在整段 execute/trap 往返上；后续所有线程访问都限制在短闭包里。
-            let schedule_log_index = DEBUG_SCHEDULE_LOGS.fetch_add(1, Ordering::SeqCst);
-            if schedule_log_index < 16 {
-                let (tid, pc, sp, ra) = unsafe {
-                    (*processor)
-                        .with_current_task(|task| {
-                            (
-                                task.tid,
-                                task.context.context.pc(),
-                                task.context.context.sp(),
-                                task.context.context.ra(),
-                            )
-                        })
-                        .unwrap()
-                };
-                log::info!("schedule: tid={tid:?} pc={pc:#x} sp={sp:#x} ra={ra:#x}");
-            }
-            unsafe {
-                (*processor)
-                    .with_current_task(|task| task.context.execute(portal, ()))
-                    .unwrap();
-            }
-            let cause = scause::read().cause();
-            match cause {
-                scause::Trap::Interrupt(scause::Interrupt::SupervisorTimer) => {
-                    record_timer_tick();
-                    if take_need_resched() {
-                        unsafe { (*processor).make_current_suspend() };
-                    }
-                }
-                // ─── 系统调用 ───
-                scause::Trap::Exception(scause::Exception::UserEnvCall) => {
-                    use tg_syscall::{SyscallId as Id, SyscallResult as Ret};
-                    let (id, args, sepc_before) = unsafe {
-                        (*processor)
-                            .with_current_task(|task| {
-                                let ctx = &mut task.context.context;
-                                let sepc_before = ctx.pc();
-                                ctx.move_next();
-                                (
-                                    ctx.a(7).into(),
-                                    [ctx.a(0), ctx.a(1), ctx.a(2), ctx.a(3), ctx.a(4), ctx.a(5)],
-                                    sepc_before,
-                                )
-                            })
-                            .unwrap()
-                    };
-                    if matches!(
-                        id,
-                        Id::CLOCK_GETTIME | Id::KERNEL_INTERRUPT_CHECK | Id::EXIT | Id::CLONE
-                            | Id::WAIT4 | Id::EXECVE
-                    ) {
-                        log::info!(
-                            "syscall enter: id={id:?} sepc={sepc_before:#x} a0={:#x} a1={:#x}",
-                            args[0],
-                            args[1],
-                        );
-                    } else if !DEBUG_SYSCALL_LOGGED.swap(true, Ordering::SeqCst) {
-                        log::info!("first non-debug syscall seen: id={id:?} sepc={sepc_before:#x}");
-                    }
-                    let syscall_ret = tg_syscall::handle(Caller { entity: 0, flow: 0 }, id, args);
-                    if matches!(
-                        id,
-                        Id::CLOCK_GETTIME | Id::KERNEL_INTERRUPT_CHECK | Id::EXIT | Id::CLONE
-                            | Id::WAIT4 | Id::EXECVE
-                    ) {
-                        match syscall_ret {
-                            Ret::Done(ret) => log::info!("syscall return: id={id:?} ret={ret}"),
-                            Ret::Unsupported(unsupported) => {
-                                log::info!(
-                                    "syscall return: id={id:?} unsupported={unsupported:?}"
-                                );
-                            }
-                        }
-                    }
-
-                    // ─── 信号处理 ───
-                    let signal_result = unsafe {
-                        (*processor)
-                            .with_current_task_proc(|task, current_proc| {
-                                current_proc
-                                    .signal
-                                    .handle_signals(&mut task.context.context)
-                            })
-                            .unwrap()
-                    };
-                    match signal_result {
-                        SignalResult::ProcessKilled(exit_code) => unsafe {
-                            (*processor).make_current_exited(exit_code as _)
-                        },
-                        _ => match syscall_ret {
-                            Ret::Done(ret) => match id {
-                                Id::EXIT => unsafe { (*processor).make_current_exited(ret) },
-                                // ─── 本章新增：同步原语阻塞处理 ───
-                                // 当 semaphore_down / mutex_lock / condvar_wait 返回 -1 时，
-                                // 表示资源不可用，将当前线程标记为阻塞态
-                                Id::SEMAPHORE_DOWN
-                                | Id::CONDVAR_WAIT
-                                | Id::RWLOCK_READ_LOCK
-                                | Id::RWLOCK_WRITE_LOCK => {
-                                    unsafe {
-                                        (*processor)
-                                            .with_current_task(|task| {
-                                                *task.context.context.a_mut(0) = ret as _;
-                                            })
-                                            .unwrap();
-                                    }
-                                    if ret == -1 {
-                                        // 阻塞：从就绪队列移除，等待资源释放后唤醒
-                                        unsafe { (*processor).make_current_blocked() };
-                                    } else {
-                                        // 成功获取：正常挂起（时间片轮转）
-                                        unsafe { (*processor).make_current_suspend() };
-                                    }
-                                }
-                                Id::MUTEX_LOCK => {
-                                    unsafe {
-                                        (*processor)
-                                            .with_current_task(|task| {
-                                                *task.context.context.a_mut(0) = ret as _;
-                                            })
-                                            .unwrap();
-                                    }
-                                    if ret == -1 {
-                                        unsafe { (*processor).make_current_blocked() };
-                                    } else {
-                                        unsafe { (*processor).make_current_suspend() };
-                                    }
-                                }
-                                _ => {
-                                    unsafe {
-                                        (*processor)
-                                            .with_current_task(|task| {
-                                                *task.context.context.a_mut(0) = ret as _;
-                                            })
-                                            .unwrap();
-                                    }
-                                    unsafe { (*processor).make_current_suspend() };
-                                }
-                            },
-                            Ret::Unsupported(_) => {
-                                log::info!("id = {id:?}");
-                                unsafe { (*processor).make_current_exited(-2) };
-                            }
-                        },
-                    }
-                }
-                e => {
-                    let sepc = riscv::register::sepc::read();
-                    let stval = riscv::register::stval::read();
-                    log::error!("unsupported trap: {e:?} sepc={sepc:#x} stval={stval:#x}");
-                    unsafe { (*processor).make_current_exited(-3) };
-                }
-            }
-        } else {
-            println!("no task");
-            break;
-        }
+    #[cfg(target_arch = "riscv64")]
+    {
+        SECONDARY_BOOT_READY.store(1, Ordering::SeqCst);
+        unsafe { core::arch::asm!("fence rw, rw") };
+        log::info!("boot hart released secondary harts");
     }
-
-    tg_sbi::shutdown(false)
+    scheduler_loop()
 }
 
 /// panic 处理
@@ -647,22 +884,23 @@ fn map_portal(space: &AddressSpace<Sv39, Sv39Manager>) {
 /// - 所有操作通过 `ProcessorInner`（PThreadManager）进行双层管理
 mod impls {
     use crate::{
-        build_flags,
-        fs::{read_all, Fd, FS},
+        KernelInterruptGuard, PROCESSOR, Sv39, TIMER_INTERVAL, Thread, build_flags,
+        current_hart_id, current_kernel_timer_interrupts, current_timer_ticks, fill_hart_snapshot,
+        fs::{FS, Fd, read_all},
         processor::ProcessorInner,
-        program_next_timer, KernelInterruptGuard,
-        KERNEL_TIMER_INTERRUPTS, Sv39, Thread, TIMER_INTERVAL, PROCESSOR,
+        program_next_timer,
     };
+    use alloc::boxed::Box;
     use alloc::collections::BTreeMap;
     use alloc::sync::Arc;
     use alloc::{alloc::alloc_zeroed, string::String, vec::Vec};
-    use core::{alloc::Layout, cmp::min, ptr::NonNull, sync::atomic::Ordering};
+    use core::{alloc::Layout, cmp::min, ptr::NonNull};
     use spin::Mutex;
     use tg_console::log;
-    use tg_easy_fs::{make_pipe, FSManager, OpenFlags, UserBuffer};
+    use tg_easy_fs::{FSManager, OpenFlags, UserBuffer, make_pipe};
     use tg_kernel_vm::{
-        page_table::{MmuMeta, Pte, VAddr, VmFlags, VmMeta, PPN, VPN},
         AddressSpace, PageManager,
+        page_table::{MmuMeta, PPN, Pte, VAddr, VPN, VmFlags, VmMeta},
     };
     use tg_signal::SignalNo;
     use tg_sync::{Condvar, Mutex as MutexTrait, MutexBlocking, RwLock, Semaphore, SpinLock};
@@ -692,11 +930,17 @@ mod impls {
 
     impl PageManager<Sv39> for Sv39Manager {
         #[inline]
-        fn new_root() -> Self { Self(NonNull::new(Self::page_alloc(1)).unwrap()) }
+        fn new_root() -> Self {
+            Self(NonNull::new(Self::page_alloc(1)).unwrap())
+        }
         #[inline]
-        fn root_ppn(&self) -> PPN<Sv39> { PPN::new(self.0.as_ptr() as usize >> Sv39::PAGE_BITS) }
+        fn root_ppn(&self) -> PPN<Sv39> {
+            PPN::new(self.0.as_ptr() as usize >> Sv39::PAGE_BITS)
+        }
         #[inline]
-        fn root_ptr(&self) -> NonNull<Pte<Sv39>> { self.0 }
+        fn root_ptr(&self) -> NonNull<Pte<Sv39>> {
+            self.0
+        }
         #[inline]
         fn p_to_v<T>(&self, ppn: PPN<Sv39>) -> NonNull<T> {
             unsafe { NonNull::new_unchecked(VPN::<Sv39>::new(ppn.val()).base().as_mut_ptr()) }
@@ -706,14 +950,20 @@ mod impls {
             PPN::new(VAddr::<Sv39>::new(ptr.as_ptr() as _).floor().val())
         }
         #[inline]
-        fn check_owned(&self, pte: Pte<Sv39>) -> bool { pte.flags().contains(Self::OWNED) }
+        fn check_owned(&self, pte: Pte<Sv39>) -> bool {
+            pte.flags().contains(Self::OWNED)
+        }
         #[inline]
         fn allocate(&mut self, len: usize, flags: &mut VmFlags<Sv39>) -> NonNull<u8> {
             *flags |= Self::OWNED;
             NonNull::new(Self::page_alloc(len)).unwrap()
         }
-        fn deallocate(&mut self, _pte: Pte<Sv39>, _len: usize) -> usize { todo!() }
-        fn drop_root(&mut self) { todo!() }
+        fn deallocate(&mut self, _pte: Pte<Sv39>, _len: usize) -> usize {
+            todo!()
+        }
+        fn drop_root(&mut self) {
+            todo!()
+        }
     }
 
     // ─── 控制台 ───
@@ -722,7 +972,9 @@ mod impls {
     pub struct Console;
     impl tg_console::Console for Console {
         #[inline]
-        fn put_char(&self, c: u8) { tg_sbi::console_putchar(c); }
+        fn put_char(&self, c: u8) {
+            tg_sbi::console_putchar(c);
+        }
     }
 
     // ─── 系统调用实现 ───
@@ -758,7 +1010,35 @@ mod impls {
         true
     }
 
-    fn is_unsafe_state(available: &[usize], allocation: &[Vec<usize>], need: &[Vec<usize>]) -> bool {
+    fn copy_to_user(
+        address_space: &AddressSpace<Sv39, Sv39Manager>,
+        user_buf: usize,
+        src: &[u8],
+    ) -> bool {
+        let page_size = 1usize << Sv39::PAGE_BITS;
+        let mut copied = 0usize;
+        while copied < src.len() {
+            let Some(user_addr) = user_buf.checked_add(copied) else {
+                return false;
+            };
+            let offset = user_addr & (page_size - 1);
+            let chunk = min(page_size - offset, src.len() - copied);
+            let Some(dst) = address_space.translate::<u8>(VAddr::new(user_addr), WRITEABLE) else {
+                return false;
+            };
+            unsafe {
+                core::ptr::copy_nonoverlapping(src.as_ptr().add(copied), dst.as_ptr(), chunk);
+            }
+            copied += chunk;
+        }
+        true
+    }
+
+    fn is_unsafe_state(
+        available: &[usize],
+        allocation: &[Vec<usize>],
+        need: &[Vec<usize>],
+    ) -> bool {
         let n = allocation.len();
         let m = available.len();
         let mut work = available.to_vec();
@@ -791,7 +1071,12 @@ mod impls {
         request_tid: ThreadId,
         request_mutex_id: usize,
     ) -> bool {
-        let tids = unsafe { (*processor).get_thread(pid).map(|v| v.clone()).unwrap_or_default() };
+        let tids = unsafe {
+            (*processor)
+                .get_thread(pid)
+                .map(|v| v.clone())
+                .unwrap_or_default()
+        };
         if tids.is_empty() {
             return false;
         }
@@ -856,7 +1141,12 @@ mod impls {
         request_tid: ThreadId,
         request_sem_id: usize,
     ) -> bool {
-        let tids = unsafe { (*processor).get_thread(pid).map(|v| v.clone()).unwrap_or_default() };
+        let tids = unsafe {
+            (*processor)
+                .get_thread(pid)
+                .map(|v| v.clone())
+                .unwrap_or_default()
+        };
         if tids.is_empty() {
             return false;
         }
@@ -917,7 +1207,7 @@ mod impls {
 
     /// IO 系统调用（与第七章基本相同，本章新增 lseek / fstat 支持 Doom 文件 I/O）
     ///
-    /// 注意：本章通过 `get_current_proc()` 获取当前线程所属的进程，
+    /// 注意：本章通过 `get_current_proc_for(current_hart_id())` 获取当前线程所属的进程，
     /// 而非直接 `current()`，因为 fd_table 属于进程而非线程。
     impl IO for SyscallContext {
         fn input_getchar(&self, _caller: Caller) -> isize {
@@ -933,12 +1223,13 @@ mod impls {
         }
 
         fn write(&self, _caller: Caller, fd: usize, buf: usize, count: usize) -> isize {
-            let current = PROCESSOR.get_mut().get_current_proc().unwrap();
+            let current = PROCESSOR.get_mut().get_current_proc_for(current_hart_id()).unwrap();
             if let Some(ptr) = current.address_space.translate(VAddr::new(buf), READABLE) {
                 if fd == STDOUT || fd == STDDEBUG {
                     print!("{}", unsafe {
                         core::str::from_utf8_unchecked(core::slice::from_raw_parts(
-                            ptr.as_ptr(), count,
+                            ptr.as_ptr(),
+                            count,
                         ))
                     });
                     count as _
@@ -948,18 +1239,30 @@ mod impls {
                         let mut v: Vec<&'static mut [u8]> = Vec::new();
                         unsafe { v.push(core::slice::from_raw_parts_mut(ptr.as_ptr(), count)) };
                         file.write(UserBuffer::new(v)) as _
-                    } else { log::error!("file not writable"); -1 }
-                } else { log::error!("unsupported fd: {fd}"); -1 }
-            } else { log::error!("ptr not readable"); -1 }
+                    } else {
+                        log::error!("file not writable");
+                        -1
+                    }
+                } else {
+                    log::error!("unsupported fd: {fd}");
+                    -1
+                }
+            } else {
+                log::error!("ptr not readable");
+                -1
+            }
         }
 
         fn read(&self, _caller: Caller, fd: usize, buf: usize, count: usize) -> isize {
-            let current = PROCESSOR.get_mut().get_current_proc().unwrap();
+            let current = PROCESSOR.get_mut().get_current_proc_for(current_hart_id()).unwrap();
             if let Some(ptr) = current.address_space.translate(VAddr::new(buf), WRITEABLE) {
                 if fd == STDIN {
                     let mut ptr = ptr.as_ptr();
                     for _ in 0..count {
-                        unsafe { *ptr = tg_sbi::console_getchar() as u8; ptr = ptr.add(1); }
+                        unsafe {
+                            *ptr = tg_sbi::console_getchar() as u8;
+                            ptr = ptr.add(1);
+                        }
                     }
                     count as _
                 } else if let Some(file) = &current.fd_table[fd] {
@@ -968,20 +1271,31 @@ mod impls {
                         let mut v: Vec<&'static mut [u8]> = Vec::new();
                         unsafe { v.push(core::slice::from_raw_parts_mut(ptr.as_ptr(), count)) };
                         file.read(UserBuffer::new(v)) as _
-                    } else { log::error!("file not readable"); -1 }
-                } else { log::error!("unsupported fd: {fd}"); -1 }
-            } else { log::error!("ptr not writeable"); -1 }
+                    } else {
+                        log::error!("file not readable");
+                        -1
+                    }
+                } else {
+                    log::error!("unsupported fd: {fd}");
+                    -1
+                }
+            } else {
+                log::error!("ptr not writeable");
+                -1
+            }
         }
 
         fn open(&self, _caller: Caller, path: usize, flags: usize) -> isize {
-            let current = PROCESSOR.get_mut().get_current_proc().unwrap();
+            let current = PROCESSOR.get_mut().get_current_proc_for(current_hart_id()).unwrap();
             if let Some(ptr) = current.address_space.translate(VAddr::new(path), READABLE) {
                 let mut string = String::new();
                 let mut raw_ptr: *mut u8 = ptr.as_ptr();
                 loop {
                     unsafe {
                         let ch = *raw_ptr;
-                        if ch == 0 { break; }
+                        if ch == 0 {
+                            break;
+                        }
                         string.push(ch as char);
                         raw_ptr = (raw_ptr as usize + 1) as *mut u8;
                     }
@@ -990,53 +1304,81 @@ mod impls {
                     FS.open(string.as_str(), OpenFlags::from_bits(flags as u32).unwrap())
                 {
                     let new_fd = current.fd_table.len();
-                    current.fd_table.push(Some(Mutex::new(Fd::File((*file_handle).clone()))));
+                    current
+                        .fd_table
+                        .push(Some(Mutex::new(Fd::File((*file_handle).clone()))));
                     new_fd as isize
-                } else { -1 }
-            } else { log::error!("ptr not writeable"); -1 }
+                } else {
+                    -1
+                }
+            } else {
+                log::error!("ptr not writeable");
+                -1
+            }
         }
 
         #[inline]
         fn close(&self, _caller: Caller, fd: usize) -> isize {
-            let current = PROCESSOR.get_mut().get_current_proc().unwrap();
-            if fd >= current.fd_table.len() || current.fd_table[fd].is_none() { return -1; }
+            let current = PROCESSOR.get_mut().get_current_proc_for(current_hart_id()).unwrap();
+            if fd >= current.fd_table.len() || current.fd_table[fd].is_none() {
+                return -1;
+            }
             current.fd_table[fd].take();
             0
         }
 
         /// pipe 系统调用
         fn pipe(&self, _caller: Caller, pipe: usize) -> isize {
-            let current = PROCESSOR.get_mut().get_current_proc().unwrap();
+            let current = PROCESSOR.get_mut().get_current_proc_for(current_hart_id()).unwrap();
             let (read_end, write_end) = make_pipe();
             let read_fd = current.fd_table.len();
             let write_fd = read_fd + 1;
-            if let Some(mut ptr) = current.address_space
+            if let Some(mut ptr) = current
+                .address_space
                 .translate::<usize>(VAddr::new(pipe), WRITEABLE)
-            { unsafe { *ptr.as_mut() = read_fd }; } else { return -1; }
-            if let Some(mut ptr) = current.address_space
+            {
+                unsafe { *ptr.as_mut() = read_fd };
+            } else {
+                return -1;
+            }
+            if let Some(mut ptr) = current
+                .address_space
                 .translate::<usize>(VAddr::new(pipe + core::mem::size_of::<usize>()), WRITEABLE)
-            { unsafe { *ptr.as_mut() = write_fd }; } else { return -1; }
-            current.fd_table.push(Some(Mutex::new(Fd::PipeRead(read_end))));
-            current.fd_table.push(Some(Mutex::new(Fd::PipeWrite(write_end))));
+            {
+                unsafe { *ptr.as_mut() = write_fd };
+            } else {
+                return -1;
+            }
+            current
+                .fd_table
+                .push(Some(Mutex::new(Fd::PipeRead(read_end))));
+            current
+                .fd_table
+                .push(Some(Mutex::new(Fd::PipeWrite(write_end))));
             0
         }
 
         fn lseek(&self, _caller: Caller, fd: usize, offset: isize, whence: usize) -> isize {
-            let current = PROCESSOR.get_mut().get_current_proc().unwrap();
+            let current = PROCESSOR.get_mut().get_current_proc_for(current_hart_id()).unwrap();
             if fd >= current.fd_table.len() || current.fd_table[fd].is_none() {
                 return -1;
             }
-            current.fd_table[fd].as_ref().unwrap().lock().lseek(offset, whence)
+            current.fd_table[fd]
+                .as_ref()
+                .unwrap()
+                .lock()
+                .lseek(offset, whence)
         }
 
         fn fstat(&self, _caller: Caller, fd: usize, st: usize) -> isize {
-            let current = PROCESSOR.get_mut().get_current_proc().unwrap();
+            let current = PROCESSOR.get_mut().get_current_proc_for(current_hart_id()).unwrap();
             if fd >= current.fd_table.len() || current.fd_table[fd].is_none() {
                 return -1;
             }
             let file_size = current.fd_table[fd].as_ref().unwrap().lock().file_size();
             let is_file = file_size > 0;
-            if let Some(mut ptr) = current.address_space
+            if let Some(mut ptr) = current
+                .address_space
                 .translate::<Stat>(VAddr::new(st), WRITEABLE)
             {
                 let stat = unsafe { ptr.as_mut() };
@@ -1054,16 +1396,20 @@ mod impls {
     /// 进程管理系统调用
     impl Process for SyscallContext {
         #[inline]
-        fn exit(&self, _caller: Caller, exit_code: usize) -> isize { exit_code as isize }
+        fn exit(&self, _caller: Caller, exit_code: usize) -> isize {
+            exit_code as isize
+        }
 
-        fn sbrk(&self, _caller: Caller, _size: i32) -> isize { -1 }
+        fn sbrk(&self, _caller: Caller, _size: i32) -> isize {
+            -1
+        }
 
         /// fork：创建子进程（返回 Process + Thread）
         fn fork(&self, _caller: Caller) -> isize {
             let processor: *mut ProcessorInner = PROCESSOR.get_mut() as *mut ProcessorInner;
             let (parent_pid, proc, mut thread) = unsafe {
                 (*processor)
-                    .with_current_proc(|current_proc| {
+                    .with_current_proc_for(current_hart_id(), |current_proc| {
                         let parent_pid = current_proc.pid;
                         let (proc, thread) = current_proc.fork().unwrap();
                         (parent_pid, proc, thread)
@@ -1074,7 +1420,7 @@ mod impls {
             *thread.context.context.a_mut(0) = 0 as _;
             unsafe {
                 (*processor).add_proc(pid, proc, parent_pid);
-                (*processor).add(thread.tid, thread, pid);
+                (*processor).add(thread.tid, Box::new(thread), pid);
             }
             pid.get_usize() as isize
         }
@@ -1082,8 +1428,9 @@ mod impls {
         /// exec：从文件系统加载新程序
         fn exec(&self, _caller: Caller, path: usize, count: usize) -> isize {
             const READABLE: VmFlags<Sv39> = build_flags("RV");
-            let current = PROCESSOR.get_mut().get_current_proc().unwrap();
-            current.address_space
+            let current = PROCESSOR.get_mut().get_current_proc_for(current_hart_id()).unwrap();
+            current
+                .address_space
                 .translate(VAddr::new(path), READABLE)
                 .map(|ptr| unsafe {
                     core::str::from_utf8_unchecked(core::slice::from_raw_parts(ptr.as_ptr(), count))
@@ -1092,17 +1439,23 @@ mod impls {
                 .map_or_else(
                     || {
                         log::error!("unknown app, select one in the list: ");
-                        FS.readdir("").unwrap().into_iter().for_each(|app| println!("{app}"));
+                        FS.readdir("")
+                            .unwrap()
+                            .into_iter()
+                            .for_each(|app| println!("{app}"));
                         println!();
                         -1
                     },
                     |fd| {
                         let data = read_all(fd);
-                        log::info!("exec: read {} bytes", data.len());
+                        log::debug!("exec: read {} bytes", data.len());
                         let elf = ElfFile::new(&data).unwrap();
-                        log::info!("exec: ELF parsed, entry={:#x}", elf.header.pt2.entry_point());
+                        log::debug!(
+                            "exec: ELF parsed, entry={:#x}",
+                            elf.header.pt2.entry_point()
+                        );
                         current.exec(elf);
-                        log::info!("exec: address space replaced, resuming user");
+                        log::debug!("exec: address space replaced, resuming user");
                         0
                     },
                 )
@@ -1112,11 +1465,11 @@ mod impls {
             let processor: *mut ProcessorInner = PROCESSOR.get_mut() as *mut ProcessorInner;
             const WRITABLE: VmFlags<Sv39> = build_flags("W_V");
             if let Some((dead_pid, exit_code)) =
-                unsafe { (*processor).wait(ProcId::from_usize(pid as usize)) }
+                unsafe { (*processor).wait_for(current_hart_id(), ProcId::from_usize(pid as usize)) }
             {
                 let wrote = unsafe {
                     (*processor)
-                        .with_current_proc(|current| {
+                        .with_current_proc_for(current_hart_id(), |current| {
                             current
                                 .address_space
                                 .translate::<i32>(VAddr::new(exit_code_ptr), WRITABLE)
@@ -1131,17 +1484,25 @@ mod impls {
                     return -1;
                 }
                 dead_pid.get_usize() as isize
-            } else { return -1; }
+            } else {
+                return -1;
+            }
         }
 
         fn getpid(&self, _caller: Caller) -> isize {
-            PROCESSOR.get_mut().current_pid().unwrap().get_usize() as _
+            PROCESSOR
+                .get_mut()
+                .current_pid_for(current_hart_id())
+                .unwrap()
+                .get_usize() as _
         }
     }
 
     impl Scheduling for SyscallContext {
         #[inline]
-        fn sched_yield(&self, _caller: Caller) -> isize { 0 }
+        fn sched_yield(&self, _caller: Caller) -> isize {
+            0
+        }
     }
 
     impl Clock for SyscallContext {
@@ -1150,9 +1511,13 @@ mod impls {
             const WRITABLE: VmFlags<Sv39> = build_flags("W_V");
             match clock_id {
                 ClockId::CLOCK_MONOTONIC => {
-                    log::info!("clock_gettime: tp={tp:#x}");
-                    if let Some(mut ptr) = PROCESSOR.get_mut().get_current_proc().unwrap()
-                        .address_space.translate(VAddr::new(tp), WRITABLE)
+                    log::debug!("clock_gettime: tp={tp:#x}");
+                    if let Some(mut ptr) = PROCESSOR
+                        .get_mut()
+                        .get_current_proc_for(current_hart_id())
+                        .unwrap()
+                        .address_space
+                        .translate(VAddr::new(tp), WRITABLE)
                     {
                         let time = riscv::register::time::read() * 10000 / 125;
                         *unsafe { ptr.as_mut() } = TimeSpec {
@@ -1160,7 +1525,10 @@ mod impls {
                             tv_nsec: time % 1_000_000_000,
                         };
                         0
-                    } else { log::error!("ptr not readable"); -1 }
+                    } else {
+                        log::error!("ptr not readable");
+                        -1
+                    }
                 }
                 _ => -1,
             }
@@ -1169,12 +1537,13 @@ mod impls {
 
     impl tg_syscall::KernelTest for SyscallContext {
         fn kernel_interrupt_check(&self, _caller: Caller, min_interrupts: usize) -> isize {
+            let hart_id = current_hart_id();
             let min_interrupts = min_interrupts.max(1) as u64;
-            let start_interrupts = KERNEL_TIMER_INTERRUPTS.load(Ordering::SeqCst);
+            let start_interrupts = current_kernel_timer_interrupts();
             let start_time = riscv::register::time::read64();
             let timeout = TIMER_INTERVAL.saturating_mul(min_interrupts + 32);
-            log::info!(
-                "kernel_interrupt_check: enter min_interrupts={} start_interrupts={} start_time={}",
+            log::debug!(
+                "kernel_interrupt_check: hart{hart_id} enter min_interrupts={} start_interrupts={} start_time={}",
                 min_interrupts,
                 start_interrupts,
                 start_time,
@@ -1186,10 +1555,9 @@ mod impls {
             program_next_timer();
 
             loop {
-                let observed =
-                    KERNEL_TIMER_INTERRUPTS.load(Ordering::SeqCst).saturating_sub(start_interrupts);
+                let observed = current_kernel_timer_interrupts().saturating_sub(start_interrupts);
                 if observed >= min_interrupts {
-                    log::info!("kernel_interrupt_check: success observed={observed}");
+                    log::info!("kernel_interrupt_check: hart{hart_id} success observed={observed}");
                     return observed as isize;
                 }
                 if riscv::register::time::read64().wrapping_sub(start_time) >= timeout {
@@ -1197,11 +1565,11 @@ mod impls {
                     let sip = riscv::register::sip::read();
                     let sstatus = riscv::register::sstatus::read();
                     log::warn!(
-                        "kernel_interrupt_check timeout: observed={observed} sie.stimer={} sip.stimer={} sstatus.sie={} ticks={}",
+                        "kernel_interrupt_check timeout on hart{hart_id}: observed={observed} sie.stimer={} sip.stimer={} sstatus.sie={} ticks={}",
                         sie.stimer(),
                         sip.stimer(),
                         sstatus.sie(),
-                        crate::TIMER_TICKS.load(Ordering::SeqCst),
+                        current_timer_ticks(),
                     );
                     return observed as isize;
                 }
@@ -1210,12 +1578,33 @@ mod impls {
                 }
             }
         }
+
+        fn kernel_hart_snapshot(&self, _caller: Caller, out_ptr: usize, out_len: usize) -> isize {
+            if out_len < core::mem::size_of::<HartSnapshot>() {
+                return -1;
+            }
+            let current = PROCESSOR.get_mut().get_current_proc_for(current_hart_id()).unwrap();
+            let mut snapshot = HartSnapshot::default();
+            fill_hart_snapshot(&mut snapshot);
+            let bytes = unsafe {
+                core::slice::from_raw_parts(
+                    (&snapshot as *const HartSnapshot).cast::<u8>(),
+                    core::mem::size_of::<HartSnapshot>(),
+                )
+            };
+            if copy_to_user(&current.address_space, out_ptr, bytes) {
+                snapshot.online_harts as isize
+            } else {
+                -1
+            }
+        }
     }
 
     /// 信号系统调用（与第七章相同）
     impl Signal for SyscallContext {
         fn kill(&self, _caller: Caller, pid: isize, signum: u8) -> isize {
-            if let Some(target_task) = PROCESSOR.get_mut()
+            if let Some(target_task) = PROCESSOR
+                .get_mut()
                 .get_proc(ProcId::from_usize(pid as usize))
             {
                 if let Ok(signal_no) = SignalNo::try_from(signum) {
@@ -1228,22 +1617,49 @@ mod impls {
             -1
         }
 
-        fn sigaction(&self, _caller: Caller, signum: u8, action: usize, old_action: usize) -> isize {
-            if signum as usize > tg_signal::MAX_SIG { return -1; }
-            let current = PROCESSOR.get_mut().get_current_proc().unwrap();
+        fn sigaction(
+            &self,
+            _caller: Caller,
+            signum: u8,
+            action: usize,
+            old_action: usize,
+        ) -> isize {
+            if signum as usize > tg_signal::MAX_SIG {
+                return -1;
+            }
+            let current = PROCESSOR.get_mut().get_current_proc_for(current_hart_id()).unwrap();
             if let Ok(signal_no) = SignalNo::try_from(signum) {
-                if signal_no == SignalNo::ERR { return -1; }
+                if signal_no == SignalNo::ERR {
+                    return -1;
+                }
                 if old_action as usize != 0 {
-                    if let Some(mut ptr) = current.address_space.translate(VAddr::new(old_action), WRITEABLE) {
+                    if let Some(mut ptr) = current
+                        .address_space
+                        .translate(VAddr::new(old_action), WRITEABLE)
+                    {
                         if let Some(signal_action) = current.signal.get_action_ref(signal_no) {
                             *unsafe { ptr.as_mut() } = signal_action;
-                        } else { return -1; }
-                    } else { return -1; }
+                        } else {
+                            return -1;
+                        }
+                    } else {
+                        return -1;
+                    }
                 }
                 if action as usize != 0 {
-                    if let Some(ptr) = current.address_space.translate(VAddr::new(action), READABLE) {
-                        if !current.signal.set_action(signal_no, &unsafe { *ptr.as_ptr() }) { return -1; }
-                    } else { return -1; }
+                    if let Some(ptr) = current
+                        .address_space
+                        .translate(VAddr::new(action), READABLE)
+                    {
+                        if !current
+                            .signal
+                            .set_action(signal_no, &unsafe { *ptr.as_ptr() })
+                        {
+                            return -1;
+                        }
+                    } else {
+                        return -1;
+                    }
                 }
                 return 0;
             }
@@ -1251,15 +1667,22 @@ mod impls {
         }
 
         fn sigprocmask(&self, _caller: Caller, mask: usize) -> isize {
-            PROCESSOR.get_mut().get_current_proc().unwrap().signal.update_mask(mask) as isize
+            PROCESSOR
+                .get_mut()
+                .get_current_proc_for(current_hart_id())
+                .unwrap()
+                .signal
+                .update_mask(mask) as isize
         }
 
         fn sigreturn(&self, _caller: Caller) -> isize {
             let processor: *mut ProcessorInner = PROCESSOR.get_mut() as *mut ProcessorInner;
             let ok = unsafe {
                 (*processor)
-                    .with_current_task_proc(|current_thread, current_proc| {
-                        current_proc.signal.sig_return(&mut current_thread.context.context)
+                    .with_current_task_proc_for(current_hart_id(), |current_thread, current_proc| {
+                        current_proc
+                            .signal
+                            .sig_return(&mut current_thread.context.context)
                     })
                     .unwrap()
             };
@@ -1278,12 +1701,13 @@ mod impls {
             // 分配 2 页用户栈
             let stack = unsafe {
                 alloc_zeroed(Layout::from_size_align_unchecked(
-                    2 << Sv39::PAGE_BITS, 1 << Sv39::PAGE_BITS,
+                    2 << Sv39::PAGE_BITS,
+                    1 << Sv39::PAGE_BITS,
                 ))
             };
             let (pid, satp, user_sp) = unsafe {
                 (*processor)
-                    .with_current_proc(|current_proc| {
+                    .with_current_proc_for(current_hart_id(), |current_proc| {
                         // 从最高用户栈位置向下搜索空闲的页表区域
                         let mut vpn = VPN::<Sv39>::new((1 << 26) - 2);
                         let addrspace = &mut current_proc.address_space;
@@ -1312,23 +1736,35 @@ mod impls {
             *context.a_mut(0) = arg;
             let thread = Thread::new(satp, context);
             let tid = thread.tid;
-            unsafe { (*processor).add(tid, thread, pid); }
+            unsafe {
+                (*processor).add(tid, Box::new(thread), pid);
+            }
             tid.get_usize() as _
         }
 
         /// gettid：获取当前线程 TID
         fn gettid(&self, _caller: Caller) -> isize {
-            PROCESSOR.get_mut().current_tid().unwrap().get_usize() as _
+            PROCESSOR
+                .get_mut()
+                .current_tid_for(current_hart_id())
+                .unwrap()
+                .get_usize() as _
         }
 
         /// waittid：等待指定线程退出
         fn waittid(&self, _caller: Caller, tid: usize) -> isize {
             let processor: *mut ProcessorInner = PROCESSOR.get_mut() as *mut ProcessorInner;
-            let current_tid = unsafe { (*processor).current_tid().unwrap() };
-            if tid == current_tid.get_usize() { return -1; }
-            if let Some(exit_code) = unsafe { (*processor).waittid(ThreadId::from_usize(tid)) } {
+            let current_tid = unsafe { (*processor).current_tid_for(current_hart_id()).unwrap() };
+            if tid == current_tid.get_usize() {
+                return -1;
+            }
+            if let Some(exit_code) =
+                unsafe { (*processor).waittid_for(current_hart_id(), ThreadId::from_usize(tid)) }
+            {
                 exit_code
-            } else { -1 }
+            } else {
+                -1
+            }
         }
     }
 
@@ -1339,14 +1775,20 @@ mod impls {
     impl SyncMutex for SyscallContext {
         /// 创建信号量（初始计数 = res_count）
         fn semaphore_create(&self, _caller: Caller, res_count: usize) -> isize {
-            let current_proc = PROCESSOR.get_mut().get_current_proc().unwrap();
-            let id = if let Some(id) = current_proc.semaphore_list.iter().enumerate()
-                .find(|(_, item)| item.is_none()).map(|(id, _)| id)
+            let current_proc = PROCESSOR.get_mut().get_current_proc_for(current_hart_id()).unwrap();
+            let id = if let Some(id) = current_proc
+                .semaphore_list
+                .iter()
+                .enumerate()
+                .find(|(_, item)| item.is_none())
+                .map(|(id, _)| id)
             {
                 current_proc.semaphore_list[id] = Some(Arc::new(Semaphore::new(res_count)));
                 id
             } else {
-                current_proc.semaphore_list.push(Some(Arc::new(Semaphore::new(res_count))));
+                current_proc
+                    .semaphore_list
+                    .push(Some(Arc::new(Semaphore::new(res_count))));
                 current_proc.semaphore_list.len() - 1
             };
             id as isize
@@ -1357,7 +1799,7 @@ mod impls {
             let processor: *mut ProcessorInner = PROCESSOR.get_mut() as *mut ProcessorInner;
             let (tid, sem) = unsafe {
                 (*processor)
-                    .with_current_task_proc(|current, current_proc| {
+                    .with_current_task_proc_for(current_hart_id(), |current, current_proc| {
                         (
                             current.tid,
                             Arc::clone(current_proc.semaphore_list[sem_id].as_ref().unwrap()),
@@ -1366,7 +1808,9 @@ mod impls {
                     .unwrap()
             };
             if let Some(waking_tid) = sem.up(tid) {
-                unsafe { (*processor).re_enque(waking_tid); }
+                unsafe {
+                    (*processor).re_enque(waking_tid);
+                }
             }
             0
         }
@@ -1374,9 +1818,10 @@ mod impls {
         /// P 操作：获取信号量，不可用则阻塞
         fn semaphore_down(&self, _caller: Caller, sem_id: usize) -> isize {
             let processor: *mut ProcessorInner = PROCESSOR.get_mut() as *mut ProcessorInner;
-            let tid = unsafe { (*processor).current_tid().unwrap() };
+            let tid = unsafe { (*processor).current_tid_for(current_hart_id()).unwrap() };
             let (pid, deadlock_enabled, sem) = {
-                let current_proc = unsafe { (*processor).get_current_proc().unwrap() };
+                let current_proc =
+                    unsafe { (*processor).get_current_proc_for(current_hart_id()).unwrap() };
                 (
                     current_proc.pid,
                     current_proc.deadlock_detect_enabled,
@@ -1399,9 +1844,13 @@ mod impls {
             } else {
                 Some(Arc::new(SpinLock::new()))
             };
-            let current_proc = PROCESSOR.get_mut().get_current_proc().unwrap();
-            if let Some(id) = current_proc.mutex_list.iter().enumerate()
-                .find(|(_, item)| item.is_none()).map(|(id, _)| id)
+            let current_proc = PROCESSOR.get_mut().get_current_proc_for(current_hart_id()).unwrap();
+            if let Some(id) = current_proc
+                .mutex_list
+                .iter()
+                .enumerate()
+                .find(|(_, item)| item.is_none())
+                .map(|(id, _)| id)
             {
                 current_proc.mutex_list[id] = new_mutex;
                 id as isize
@@ -1416,13 +1865,15 @@ mod impls {
             let processor: *mut ProcessorInner = PROCESSOR.get_mut() as *mut ProcessorInner;
             let mutex = unsafe {
                 (*processor)
-                    .with_current_proc(|current_proc| {
+                    .with_current_proc_for(current_hart_id(), |current_proc| {
                         Arc::clone(current_proc.mutex_list[mutex_id].as_ref().unwrap())
                     })
                     .unwrap()
             };
             if let Some(tid) = mutex.unlock() {
-                unsafe { (*processor).re_enque(tid); }
+                unsafe {
+                    (*processor).re_enque(tid);
+                }
             }
             0
         }
@@ -1430,9 +1881,10 @@ mod impls {
         /// 加锁，已被占用则阻塞
         fn mutex_lock(&self, _caller: Caller, mutex_id: usize) -> isize {
             let processor: *mut ProcessorInner = PROCESSOR.get_mut() as *mut ProcessorInner;
-            let tid = unsafe { (*processor).current_tid().unwrap() };
+            let tid = unsafe { (*processor).current_tid_for(current_hart_id()).unwrap() };
             let (pid, deadlock_enabled, mutex) = {
-                let current_proc = unsafe { (*processor).get_current_proc().unwrap() };
+                let current_proc =
+                    unsafe { (*processor).get_current_proc_for(current_hart_id()).unwrap() };
                 (
                     current_proc.pid,
                     current_proc.deadlock_detect_enabled,
@@ -1457,14 +1909,20 @@ mod impls {
 
         /// 创建条件变量
         fn condvar_create(&self, _caller: Caller, _arg: usize) -> isize {
-            let current_proc = PROCESSOR.get_mut().get_current_proc().unwrap();
-            let id = if let Some(id) = current_proc.condvar_list.iter().enumerate()
-                .find(|(_, item)| item.is_none()).map(|(id, _)| id)
+            let current_proc = PROCESSOR.get_mut().get_current_proc_for(current_hart_id()).unwrap();
+            let id = if let Some(id) = current_proc
+                .condvar_list
+                .iter()
+                .enumerate()
+                .find(|(_, item)| item.is_none())
+                .map(|(id, _)| id)
             {
                 current_proc.condvar_list[id] = Some(Arc::new(Condvar::new()));
                 id
             } else {
-                current_proc.condvar_list.push(Some(Arc::new(Condvar::new())));
+                current_proc
+                    .condvar_list
+                    .push(Some(Arc::new(Condvar::new())));
                 current_proc.condvar_list.len() - 1
             };
             id as isize
@@ -1475,13 +1933,15 @@ mod impls {
             let processor: *mut ProcessorInner = PROCESSOR.get_mut() as *mut ProcessorInner;
             let condvar = unsafe {
                 (*processor)
-                    .with_current_proc(|current_proc| {
+                    .with_current_proc_for(current_hart_id(), |current_proc| {
                         Arc::clone(current_proc.condvar_list[condvar_id].as_ref().unwrap())
                     })
                     .unwrap()
             };
             if let Some(tid) = condvar.signal() {
-                unsafe { (*processor).re_enque(tid); }
+                unsafe {
+                    (*processor).re_enque(tid);
+                }
             }
             0
         }
@@ -1491,7 +1951,7 @@ mod impls {
             let processor: *mut ProcessorInner = PROCESSOR.get_mut() as *mut ProcessorInner;
             let (tid, condvar, mutex) = unsafe {
                 (*processor)
-                    .with_current_task_proc(|current, current_proc| {
+                    .with_current_task_proc_for(current_hart_id(), |current, current_proc| {
                         (
                             current.tid,
                             Arc::clone(current_proc.condvar_list[condvar_id].as_ref().unwrap()),
@@ -1502,16 +1962,22 @@ mod impls {
             };
             let (flag, waking_tid) = condvar.wait_with_mutex(tid, mutex);
             if let Some(waking_tid) = waking_tid {
-                unsafe { (*processor).re_enque(waking_tid); }
+                unsafe {
+                    (*processor).re_enque(waking_tid);
+                }
             }
             if !flag { -1 } else { 0 }
         }
 
         /// 创建读写锁
         fn rwlock_create(&self, _caller: Caller) -> isize {
-            let current_proc = PROCESSOR.get_mut().get_current_proc().unwrap();
-            let id = if let Some(id) = current_proc.rwlock_list.iter().enumerate()
-                .find(|(_, item)| item.is_none()).map(|(id, _)| id)
+            let current_proc = PROCESSOR.get_mut().get_current_proc_for(current_hart_id()).unwrap();
+            let id = if let Some(id) = current_proc
+                .rwlock_list
+                .iter()
+                .enumerate()
+                .find(|(_, item)| item.is_none())
+                .map(|(id, _)| id)
             {
                 current_proc.rwlock_list[id] = Some(Arc::new(RwLock::new()));
                 id
@@ -1527,7 +1993,7 @@ mod impls {
             let processor: *mut ProcessorInner = PROCESSOR.get_mut() as *mut ProcessorInner;
             let (tid, rwlock) = unsafe {
                 (*processor)
-                    .with_current_task_proc(|current, current_proc| {
+                    .with_current_task_proc_for(current_hart_id(), |current, current_proc| {
                         (
                             current.tid,
                             Arc::clone(current_proc.rwlock_list[rwlock_id].as_ref().unwrap()),
@@ -1543,7 +2009,7 @@ mod impls {
             let processor: *mut ProcessorInner = PROCESSOR.get_mut() as *mut ProcessorInner;
             let (tid, rwlock) = unsafe {
                 (*processor)
-                    .with_current_task_proc(|current, current_proc| {
+                    .with_current_task_proc_for(current_hart_id(), |current, current_proc| {
                         (
                             current.tid,
                             Arc::clone(current_proc.rwlock_list[rwlock_id].as_ref().unwrap()),
@@ -1559,7 +2025,7 @@ mod impls {
             let processor: *mut ProcessorInner = PROCESSOR.get_mut() as *mut ProcessorInner;
             let (tid, rwlock) = unsafe {
                 (*processor)
-                    .with_current_task_proc(|current, current_proc| {
+                    .with_current_task_proc_for(current_hart_id(), |current, current_proc| {
                         (
                             current.tid,
                             Arc::clone(current_proc.rwlock_list[rwlock_id].as_ref().unwrap()),
@@ -1568,7 +2034,9 @@ mod impls {
                     .unwrap()
             };
             for waking_tid in rwlock.unlock_for(tid) {
-                unsafe { (*processor).re_enque(waking_tid); }
+                unsafe {
+                    (*processor).re_enque(waking_tid);
+                }
             }
             0
         }
@@ -1578,7 +2046,7 @@ mod impls {
             if is_enable != 0 && is_enable != 1 {
                 return -1;
             }
-            let current_proc = PROCESSOR.get_mut().get_current_proc().unwrap();
+            let current_proc = PROCESSOR.get_mut().get_current_proc_for(current_hart_id()).unwrap();
             current_proc.deadlock_detect_enabled = is_enable == 1;
             0
         }
@@ -1590,8 +2058,11 @@ mod impls {
             let Some((w, h, stride)) = crate::virtio_gpu::dimensions() else {
                 return -1;
             };
-            let current = PROCESSOR.get_mut().get_current_proc().unwrap();
-            if let Some(mut ptr) = current.address_space.translate(VAddr::new(info_ptr), WRITEABLE) {
+            let current = PROCESSOR.get_mut().get_current_proc_for(current_hart_id()).unwrap();
+            if let Some(mut ptr) = current
+                .address_space
+                .translate(VAddr::new(info_ptr), WRITEABLE)
+            {
                 unsafe {
                     let base = ptr.as_mut() as *mut u32;
                     base.write_unaligned(w);
@@ -1610,7 +2081,7 @@ mod impls {
                 log::warn!("fb_present: short user buffer, len={len}, need={need}");
                 return -1;
             }
-            let current = PROCESSOR.get_mut().get_current_proc().unwrap();
+            let current = PROCESSOR.get_mut().get_current_proc_for(current_hart_id()).unwrap();
             let mut frame = FB_UPLOAD_BUF.lock();
             if frame.len() < need {
                 frame.resize(need, 0);
@@ -1645,17 +2116,27 @@ mod stub {
         const LEVEL_BITS: &'static [usize] = &[9, 9, 9];
         const PPN_POS: usize = 10;
         #[inline]
-        fn is_leaf(value: usize) -> bool { value & 0b1110 != 0 }
+        fn is_leaf(value: usize) -> bool {
+            value & 0b1110 != 0
+        }
     }
     /// 构建 VmFlags 占位
-    pub const fn build_flags(_s: &str) -> VmFlags<Sv39> { unsafe { VmFlags::from_raw(0) } }
+    pub const fn build_flags(_s: &str) -> VmFlags<Sv39> {
+        unsafe { VmFlags::from_raw(0) }
+    }
     /// 解析 VmFlags 占位
-    pub fn parse_flags(_s: &str) -> Result<VmFlags<Sv39>, ()> { Ok(unsafe { VmFlags::from_raw(0) }) }
+    pub fn parse_flags(_s: &str) -> Result<VmFlags<Sv39>, ()> {
+        Ok(unsafe { VmFlags::from_raw(0) })
+    }
 
     #[unsafe(no_mangle)]
-    pub extern "C" fn main() -> i32 { 0 }
+    pub extern "C" fn main() -> i32 {
+        0
+    }
     #[unsafe(no_mangle)]
-    pub extern "C" fn __libc_start_main() -> i32 { 0 }
+    pub extern "C" fn __libc_start_main() -> i32 {
+        0
+    }
     #[unsafe(no_mangle)]
     pub extern "C" fn rust_eh_personality() {}
 }

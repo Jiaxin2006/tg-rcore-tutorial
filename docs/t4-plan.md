@@ -72,17 +72,40 @@
    - `secondary hart` 不重复清 BSS / 不重复建堆 / 不重复初始化设备
    - 建一个最小 barrier，确保次核完成“本核 trap + 本核 timer + 本核栈/portal 槽位”初始化后再参与系统运行
    - 当前最小 SBI 还没有 HSM/IPI，第一版优先尝试“多个 hart 都进入 `_m_start`，由软件 barrier 收敛”；如果实测 QEMU 不是这样，再补最小 HSM `hart_start`
+   - 当前实现状态（2026-03-31）：这一版已经完成“boot hart 一次性初始化 + secondary hart 安全 online”，次核当前只激活内核页表并停在 `wfi` 循环，还**不会参与共享调度器**
+   - 当前验证命令：
+     - `cd tg-rcore-tutorial-ch8 && TG_CH8_INIT_APP=kernel_interrupt_check cargo run --features exercise`
+     - `cd tg-rcore-tutorial-ch8 && TG_CH8_INIT_APP=ch8_usertest cargo run --features exercise`
+   - 当前验证现象：
+     - 启动日志里能看到 `hart0 online (boot)`、`boot hart released secondary harts`、`hart1 online (secondary)`
+     - `kernel_interrupt_check` 在 `-smp 2` 下仍然能看到 `kernel timer interrupt observed` 和 `kernel_interrupt_check: success observed=2`
+     - `ch8_usertest` 在 `-smp 2` 下仍能跑到 `ch8 Usertests passed!`
 
 2. M2：把单核全局状态拆成 per-hart
    - `PROCESSOR/current/need_resched/timer_ticks/kernel_timer_interrupts` 改成“每核一份”
    - trap 入口、timer 设定、portal slot 都按 hart 区分
    - 先允许“全局 ready queue + 每核 current”的保守方案，不急着一开始就做每核 run queue
+   - 当前实现状态（2026-03-31）：已经把 `PROCESSOR.current/need_resched/timer_ticks/kernel_timer_interrupts` 拆成 per-hart，本地 timer 改成按 `mhartid` 写各自的 `mtimecmp`，secondary hart 也会独立开启 `stimer + kernel trap`
+   - 当前还没完成的部分：secondary hart 目前仍主要维护本地 timer/idle 状态，还不会真正并行跑用户线程；要进入 M3，还需要给共享调度器与同步原语补上真正的 SMP 保护
+   - 当前验证命令：
+     - `cd tg-rcore-tutorial-ch8 && TG_CH8_INIT_APP=kernel_smp_check cargo run --features exercise`
+     - `cd tg-rcore-tutorial-ch8 && TG_CH8_INIT_APP=kernel_interrupt_check cargo run --features exercise`
+   - 当前验证现象：
+     - `kernel_smp_check` 会打印两次快照，能看到 `online_mask=0x3`
+     - 快照里 `hart0 delta: ticks>0`、`hart1 delta: ticks>0 kernel_timer_interrupts>0`
+     - 日志里仍能看到 `kernel_interrupt_check: hart0 success observed=2`
 
 3. M3：真正让多核并行跑线程
    - 允许两个 hart 都从 ready queue 取任务
    - 唤醒/退出/阻塞路径先保证正确，再优化负载均衡
    - 第一版可以先不做 IPI，只依赖 timer tick 驱动其他 hart 尽快看到 `need_resched`
    - 如果发现跨核唤醒延迟太高，再增加“目标 hart 的事件标记 + MSIP/IPI”
+   - 当前实现状态（2026-03-31）：已经落地“全局 ready queue + 每核 current”的第一版共享调度器；secondary hart 会进入同一套 `scheduler_loop`，`portal` 改成按 hart 分 slot，线程管理器也增加了 `Runnable / Running(hart_id) / Blocked` 状态来避免重复调度
+   - 当前 SMP 保护策略：采用 `KERNEL_BIG_LOCK` 作为第一版大内核锁，保证共享内核状态一次只由一个 hart 修改；切到用户态前释放，trap 回内核后重新获取
+   - 当前验证现象：
+     - `kernel_smp_check` 中能看到 `user observed hart mask=0x3`
+     - `ch8_usertest` 在共享调度器下完整通过
+     - `tg-rcore-tutorial-checker --ch 8 --exercise` 结果为 `PASS 25/25`
 
 4. M4：补同步与性能展示
    - 检查所有全局共享结构是否需要 `SpinLock + 关本核中断` 或其他保护

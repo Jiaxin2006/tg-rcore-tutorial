@@ -241,6 +241,10 @@ Shell: Process 2 exited with code 0
    cd tg-rcore-tutorial-ch8/doomgeneric/doomgeneric
    make -f Makefile.rcore
    ```
+   当前 `Makefile.rcore` 默认会生成**可交互版本**（`DG_MODE=interactive`），启动后可直接接收终端键盘输入；若你只是想回到自动播放 demo 的版本，可显式执行：
+   ```bash
+   make -f Makefile.rcore DG_MODE=demo
+   ```
    生成同目录下的 `doomgeneric` 后，再在 ch8 根目录执行 `cargo build`（或 `cargo run`）以重新打包磁盘镜像。
 
 #### 运行
@@ -250,7 +254,9 @@ cd tg-rcore-tutorial-ch8
 cargo run
 ```
 
-在 Shell 中执行 **`doomgeneric`**。游戏内部分辨率为 `640×400`，内核会按比例缩放并居中到 VirtIO-GPU 分辨率。
+默认 `cargo run` 会通过 `initproc` 直接启动 `doomgeneric`；若你改成从 shell 启动，也同样执行 **`doomgeneric`** 即可。游戏内部分辨率为 `640×400`，内核会按比例缩放并居中到 VirtIO-GPU 分辨率。
+
+需要注意：当前默认已经不是强制 `-playdemo demo1` 的 demo 构建；不过原版 Doom 本身仍会在用户长时间不按键时进入 title / credits / attract mode 轮播，所以若你放着不操作，视觉上仍可能像“自动播 demo”。只要在运行 `cargo run` 的终端里按键，就会进入正常交互路径。
 
 #### 原版 Doom（本移植默认键位，见 `m_controls.c`）在做什么
 
