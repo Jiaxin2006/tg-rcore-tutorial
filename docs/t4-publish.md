@@ -24,6 +24,43 @@ The current package names and versions are:
 
 `tg-rcore-tutorial-easy-fs` is still referenced as `jiaxin2006-tg-rcore-tutorial-easy-fs-t3l8 = 0.0.1-preview.1`. If that crate has not been published from this repository yet, publish it before `tg-rcore-tutorial-ch8`.
 
+## Doom packaging
+
+The Doom-related changes are published together with `tg-rcore-tutorial-ch8`; they are not a separate crate.
+
+What is included in the `tg-rcore-tutorial-ch8` package:
+
+- `doomgeneric/**` source files, including `doomgeneric_rcore.c`
+- `doomgeneric/doomgeneric/Makefile.rcore`
+- `doomgeneric/doomgeneric/doom1.wad`
+
+What is intentionally excluded:
+
+- `doomgeneric/doomgeneric/build_rcore/**`
+- the built `doomgeneric` ELF
+- screenshots and other large local artifacts
+
+This means:
+
+1. If you modify Doom platform code, those source changes are part of the `tg-rcore-tutorial-ch8` publish.
+2. But publishing `ch8` does not automatically publish a prebuilt Doom binary.
+3. The current `build.rs` only packs Doom into `fs.img` if `doomgeneric/doomgeneric/doomgeneric` already exists locally.
+
+Recommended release flow for Doom-related changes:
+
+```bash
+git submodule update --init --recursive
+cd tg-rcore-tutorial-ch8/doomgeneric/doomgeneric
+make -f Makefile.rcore clean
+make -f Makefile.rcore DG_MODE=interactive
+cd ../../
+cargo build --features exercise --target riscv64gc-unknown-none-elf
+```
+
+After that, publish `tg-rcore-tutorial-ch8` as usual.
+
+In short: Doom source changes should be versioned and published through the `tg-rcore-tutorial-ch8` crate, and you should treat any change to `doomgeneric_rcore.c` / `Makefile.rcore` / Doom resources as a reason to bump the `ch8` crate version.
+
 ## Recommended commands
 
 Dry-run the whole chain first:
