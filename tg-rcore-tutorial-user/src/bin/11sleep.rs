@@ -4,7 +4,7 @@
 #[macro_use]
 extern crate user_lib;
 
-use user_lib::{clock_gettime, sched_yield, ClockId, TimeSpec};
+use user_lib::{ClockId, TimeSpec, clock_gettime, sched_yield};
 
 // 教学目标：
 // 通过轮询 CLOCK_MONOTONIC + yield，验证“睡眠”语义和时钟系统调用。

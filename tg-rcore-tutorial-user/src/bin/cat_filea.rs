@@ -5,7 +5,7 @@
 extern crate user_lib;
 extern crate alloc;
 
-use user_lib::{close, open, read, OpenFlags};
+use user_lib::{OpenFlags, close, open, read};
 
 // 教学目标：
 // 实现最小版 cat，验证按块循环 read 直到 EOF 的文件读取模式。

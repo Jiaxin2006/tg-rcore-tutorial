@@ -4,7 +4,7 @@
 #[macro_use]
 extern crate user_lib;
 
-use user_lib::{close, open, read, write, OpenFlags};
+use user_lib::{OpenFlags, close, open, read, write};
 
 // 教学目标：
 // 覆盖文件系统最小闭环：创建 -> 写入 -> 读取 -> 内容比对。

@@ -19,8 +19,7 @@ pub extern "C" fn main() -> i32 {
 
     println!(
         "kernel interrupt check: observed {} kernel timer interrupts during one syscall ({} ms)",
-        observed,
-        elapsed,
+        observed, elapsed,
     );
     if observed < REQUIRED_INTERRUPTS as isize {
         println!("kernel interrupt check failed!");

@@ -15,4 +15,4 @@ categories = ["no-std", "embedded", "concurrency"]
 [dependencies]
 riscv = "0.10"
 spin = "0.9"
-tg-task-manage = { package = "tg-rcore-tutorial-task-manage", path = "../tg-rcore-tutorial-task-manage", version = "0.4.8" }
+tg-task-manage = { package = "jiaxin2006-tg-rcore-tutorial-task-manage-t4", path = "../tg-rcore-tutorial-task-manage", version = "0.0.4-preview.1" }

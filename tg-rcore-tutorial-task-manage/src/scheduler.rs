@@ -16,6 +16,20 @@ pub trait Schedule<I: Copy + Ord> {
     fn fetch(&mut self) -> Option<I>;
 }
 
+/// 面向多核的调度接口。
+///
+/// 与只暴露“全局 add/fetch”的 [`Schedule`] 相比，这个 trait 允许调用方显式指定：
+/// - 任务应进入哪个 hart 的本地就绪队列
+/// - 当前 hart 取本地任务时，是否允许从其他 hart 偷取任务
+pub trait HartSchedule<I: Copy + Ord>: Schedule<I> {
+    /// 将任务放入指定 hart 的本地就绪队列。
+    fn add_for(&mut self, hart_id: usize, id: I);
+    /// 为指定 hart 选择下一个任务。
+    ///
+    /// 具体实现可以先查本地队列，再按策略从其他 hart 偷取任务。
+    fn fetch_for(&mut self, hart_id: usize) -> Option<I>;
+}
+
 /// 调度决策结果（供时钟中断等路径使用）。
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum SchedDecision<I: Copy> {

@@ -17,9 +17,9 @@ mod scheduler;
 pub use id::*;
 pub use manager::Manage;
 pub use scheduler::{
-    CfsLikeScheduler, EventKind, ExperimentSummary, FcfsScheduler, MetricsCollector,
-    MlfqScheduler, PluggableScheduler, RrScheduler, SchedDecision, SchedEvent, Schedule,
-    SjfScheduler, TaskStats, Tick,
+    CfsLikeScheduler, EventKind, ExperimentSummary, FcfsScheduler, HartSchedule,
+    MetricsCollector, MlfqScheduler, PluggableScheduler, RrScheduler, SchedDecision,
+    SchedEvent, Schedule, SjfScheduler, TaskStats, Tick,
 };
 
 pub mod workload;

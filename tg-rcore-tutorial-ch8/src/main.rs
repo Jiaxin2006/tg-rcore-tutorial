@@ -803,7 +803,9 @@ extern "C" fn rust_main(hart_id: usize) -> ! {
         PROCESSOR
             .get_mut()
             .add_proc(pid, process, ProcId::from_usize(usize::MAX));
-        PROCESSOR.get_mut().add(tid, Box::new(thread), pid);
+        PROCESSOR
+            .get_mut()
+            .add_for(BOOT_HART_ID, tid, Box::new(thread), pid);
     }
     unsafe { sie::set_stimer() };
     program_next_timer();
@@ -1420,7 +1422,7 @@ mod impls {
             *thread.context.context.a_mut(0) = 0 as _;
             unsafe {
                 (*processor).add_proc(pid, proc, parent_pid);
-                (*processor).add(thread.tid, Box::new(thread), pid);
+                (*processor).add_for(current_hart_id(), thread.tid, Box::new(thread), pid);
             }
             pid.get_usize() as isize
         }
@@ -1435,7 +1437,16 @@ mod impls {
                 .map(|ptr| unsafe {
                     core::str::from_utf8_unchecked(core::slice::from_raw_parts(ptr.as_ptr(), count))
                 })
-                .and_then(|name| FS.open(name, OpenFlags::RDONLY))
+                .and_then(|name| {
+                    log::debug!(
+                        "exec request: hart{} pid={:?} path='{}' len={}",
+                        current_hart_id(),
+                        current.pid,
+                        name,
+                        count
+                    );
+                    FS.open(name, OpenFlags::RDONLY).map(|fd| (name, fd))
+                })
                 .map_or_else(
                     || {
                         log::error!("unknown app, select one in the list: ");
@@ -1446,9 +1457,9 @@ mod impls {
                         println!();
                         -1
                     },
-                    |fd| {
+                    |(name, fd)| {
                         let data = read_all(fd);
-                        log::debug!("exec: read {} bytes", data.len());
+                        log::debug!("exec: path='{}' read {} bytes", name, data.len());
                         let elf = ElfFile::new(&data).unwrap();
                         log::debug!(
                             "exec: ELF parsed, entry={:#x}",
@@ -1737,7 +1748,7 @@ mod impls {
             let thread = Thread::new(satp, context);
             let tid = thread.tid;
             unsafe {
-                (*processor).add(tid, Box::new(thread), pid);
+                (*processor).add_for(current_hart_id(), tid, Box::new(thread), pid);
             }
             tid.get_usize() as _
         }
@@ -1809,7 +1820,7 @@ mod impls {
             };
             if let Some(waking_tid) = sem.up(tid) {
                 unsafe {
-                    (*processor).re_enque(waking_tid);
+                    (*processor).re_enque_for(current_hart_id(), waking_tid);
                 }
             }
             0
@@ -1872,7 +1883,7 @@ mod impls {
             };
             if let Some(tid) = mutex.unlock() {
                 unsafe {
-                    (*processor).re_enque(tid);
+                    (*processor).re_enque_for(current_hart_id(), tid);
                 }
             }
             0
@@ -1940,7 +1951,7 @@ mod impls {
             };
             if let Some(tid) = condvar.signal() {
                 unsafe {
-                    (*processor).re_enque(tid);
+                    (*processor).re_enque_for(current_hart_id(), tid);
                 }
             }
             0
@@ -1963,7 +1974,7 @@ mod impls {
             let (flag, waking_tid) = condvar.wait_with_mutex(tid, mutex);
             if let Some(waking_tid) = waking_tid {
                 unsafe {
-                    (*processor).re_enque(waking_tid);
+                    (*processor).re_enque_for(current_hart_id(), waking_tid);
                 }
             }
             if !flag { -1 } else { 0 }
@@ -2035,7 +2046,7 @@ mod impls {
             };
             for waking_tid in rwlock.unlock_for(tid) {
                 unsafe {
-                    (*processor).re_enque(waking_tid);
+                    (*processor).re_enque_for(current_hart_id(), waking_tid);
                 }
             }
             0

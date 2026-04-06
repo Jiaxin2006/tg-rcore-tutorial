@@ -6,7 +6,7 @@
 
 extern crate user_lib;
 
-use user_lib::{fb_get_info, fb_present, println, FbInfo};
+use user_lib::{FbInfo, fb_get_info, fb_present, println};
 
 const W: usize = 640;
 const H: usize = 400;
@@ -26,7 +26,8 @@ extern "C" fn main() -> i32 {
         info.width, info.height, info.stride
     );
 
-    let buf = unsafe { core::slice::from_raw_parts_mut(core::ptr::addr_of_mut!(FRAME).cast(), BYTES) };
+    let buf =
+        unsafe { core::slice::from_raw_parts_mut(core::ptr::addr_of_mut!(FRAME).cast(), BYTES) };
     for y in 0..H {
         for x in 0..W {
             let i = (y * W + x) * 4;

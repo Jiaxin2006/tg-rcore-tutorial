@@ -4,7 +4,7 @@
 #[macro_use]
 extern crate user_lib;
 
-use user_lib::{close, open, read, write, OpenFlags};
+use user_lib::{OpenFlags, close, open, read, write};
 
 // 教学目标：
 // 验证最基本的文件创建、写入、关闭、重开和读取流程。

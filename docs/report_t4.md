@@ -1,324 +1,489 @@
 # T4 Report
 
-## 内核态响应中断
+## 1. 目标与完成情况
 
-### 实现方式
-1. 在 [`tg-rcore-tutorial-ch8/src/main.rs`](/Users/hanjiaxin/Desktop/操作系统/tg-rcore-tutorial/tg-rcore-tutorial-ch8/src/main.rs) 中新增了一套给 **S 态内核代码** 使用的 trap 入口：
-   - `kernel_trap_entry`：保存当前内核寄存器现场后跳到 Rust handler
-   - `kernel_trap_handler`：当前只处理 `SupervisorTimer`
-   - `record_timer_tick` / `NEED_RESCHED` / `KERNEL_TIMER_INTERRUPTS`：记录 tick、置位延迟调度标志、统计内核态 timer interrupt 次数
-2. 这点在当前共享调度器版本里**仍然如此**：`kernel_trap_handler` 现在依旧只支持 `SupervisorTimer`。除了 `SupervisorTimer` 之外的其他 **kernel trap**（包括异常和其他中断）目前都会 panic。
-3. 在 [`syscall-t3l8/src/kernel/mod.rs`](/Users/hanjiaxin/Desktop/操作系统/tg-rcore-tutorial/syscall-t3l8/src/kernel/mod.rs) 中新增 `KernelTest` trait 和 `KERNEL_INTERRUPT_CHECK` syscall 分发，用来把这项能力暴露给用户态测试程序。
-4. 在 [`tg-rcore-tutorial-sbi/src/msbi.rs`](/Users/hanjiaxin/Desktop/操作系统/tg-rcore-tutorial/tg-rcore-tutorial-sbi/src/msbi.rs) 和 [`tg-rcore-tutorial-sbi/src/m_entry.asm`](/Users/hanjiaxin/Desktop/操作系统/tg-rcore-tutorial/tg-rcore-tutorial-sbi/src/m_entry.asm) 中补齐了最小 SBI 的 timer 转发逻辑：
-   - `set_timer` 写入 `mtimecmp` 后重新打开 `MTIE`
-   - M 态收到 `machine timer interrupt` 后显式置位 `STIP`
-   - M 态 trap 返回时只对 `ecall` 平移 `mepc`，不会把 timer interrupt 当成 `ecall` 处理
+本次 T4 的目标有四项：
 
-### 测试
-1. 在 [`tg-rcore-tutorial-ch8/src/main.rs`](/Users/hanjiaxin/Desktop/操作系统/tg-rcore-tutorial/tg-rcore-tutorial-ch8/src/main.rs) 中实现 `kernel_interrupt_check` 这一条专用 syscall：
-   - 进入内核后通过 `KernelInterruptGuard` 打开 S 态中断
-   - 调用 `set_stimer()` 允许响应 S 态时钟中断
-   - 调用 `program_next_timer()` 设定下一次 timer deadline
-   - 在内核里忙等一段时间，统计 `KERNEL_TIMER_INTERRUPTS` 是否增长
-2. 用户态测试程序位于 [`tg-rcore-tutorial-ch8/tg-rcore-tutorial-user/src/bin/kernel_interrupt_check.rs`](/Users/hanjiaxin/Desktop/操作系统/tg-rcore-tutorial/tg-rcore-tutorial-ch8/tg-rcore-tutorial-user/src/bin/kernel_interrupt_check.rs)。
-   它会调用上述 syscall，并以“在一次长 syscall 中观测到至少 2 次内核态 timer interrupt”为通过条件。
-3. 这项测试也已经接入 [`ch8_usertest`](/Users/hanjiaxin/Desktop/操作系统/tg-rcore-tutorial/tg-rcore-tutorial-ch8/tg-rcore-tutorial-user/src/bin/ch8_usertest.rs) 的 exercise 用户测试集；若它退出码非 0，则 `ch8_usertest` 会直接失败。
-4. 若要**单独运行**这条内核中断测试程序，可在 [`tg-rcore-tutorial-ch8`](/Users/hanjiaxin/Desktop/操作系统/tg-rcore-tutorial/tg-rcore-tutorial-ch8) 目录下执行：
-   - `TG_CH8_INIT_APP=kernel_interrupt_check cargo run --features exercise`
-5. 当前 timer 周期由 [`tg-rcore-tutorial-ch8/src/main.rs`](/Users/hanjiaxin/Desktop/操作系统/tg-rcore-tutorial/tg-rcore-tutorial-ch8/src/main.rs) 中的 `TIMER_INTERVAL = 62_500` 决定。
-   - 结合 `clock_gettime` 中 `time * 10000 / 125` 的换算，可知这里默认假定 RISC-V `time` 频率约为 `12.5 MHz`
-   - 因此 `62_500` 个 tick 大约对应 `5 ms`
-   - 这比最初的 `1 ms` 更保守一些，能明显减少大应用启动期的抢占抖动；此前暴露出来的上下文损坏问题根因仍然是 `m_trap_vector` 返回路径没有恢复被异步中断打断时的 `a0/a1`，而不是“时间片本身就错误”
+1. 支持内核态响应中断
+2. 支持多核处理
+3. 设计用户态测试程序验证正确性
+4. 设计较复杂的用户态应用展示多核带来的性能变化
 
-## 多核实现验证
+当前仓库已经完成这四项交付：
 
-### 当前状态
-1. 当前内核已经完成：
-   - `boot hart` / `secondary hart` 分流启动
-   - 每个 hart 独立开启本地 `stimer`
-   - `need_resched`、`timer_ticks`、`kernel_timer_interrupts`、以及 `PROCESSOR.current` 都改成 per-hart 状态
-   - `thread_manager` 的相关操作 都已经改成 per-hart 状态
-2. 这一阶段主要验证的是：
-   - 两个 hart 都确实进入了内核
-   - 两个 hart 都在独立接收本地 timer interrupt
-   - “当前线程”这一类 CPU 局部状态不再是假定全局唯一
+- 内核态响应中断：已完成，当前支持在 S 态较长内核路径中响应 `SupervisorTimer`
+- 多核处理：已完成，当前支持 2 hart 启动、per-hart 本地状态、共享调度器、多线程跨 hart 运行
+- 正确性测试：已完成，提供 `kernel_interrupt_check` 和 `kernel_smp_check`
+- 性能展示：已完成，提供 `smp_bench`
 
-### 验证方式
-1. 在 [`tg-rcore-tutorial-ch8`](/Users/hanjiaxin/Desktop/操作系统/tg-rcore-tutorial/tg-rcore-tutorial-ch8) 目录下单独运行多核检查程序：
-   - `TG_CH8_INIT_APP=kernel_smp_check cargo run --features exercise`
-2. 该程序会通过 `KERNEL_HART_SNAPSHOT` syscall 取两次内核快照，中间 `sleep(100)`，然后比较两次结果。
-3. 观察点包括：
-   - `online_mask=0x3`：表示 `hart0` 和 `hart1` 都已经 online
-   - `hart0 delta: ticks=...`
-   - `hart1 delta: ticks=... kernel_timer_interrupts=...`
-   - `kernel smp check passed!`
-4. 其中：
-   - `delta` 表示第二次快照减去第一次快照，也就是这 100ms 窗口内的增量
-   - `ticks` 表示对应 hart 的本地 timer 逻辑计数是否继续前进
-   - `kernel_timer_interrupts` 只统计“该 hart 在 S 态内核代码执行期间收到 timer interrupt”的次数
-5. 因此在当前实现中，看到 `hart1` 的 `kernel_timer_interrupts > 0` 而 `hart0` 的该项可能为 `0` 是正常的：
-   - `hart1` 当前主要停在内核 idle loop 中，timer 到来时走的是 `kernel_trap_handler`
-   - `hart0` 在 `kernel_smp_check` 期间大部分时间运行用户态测试程序，因此更多表现为“timer tick 在走”，而不是“内核态长路径里又被 timer 打断”
-6. 多核回归时还可以再运行：
-   - `TG_CH8_INIT_APP=kernel_interrupt_check cargo run --features exercise`
-   - `TG_CH8_INIT_APP=ch8_usertest cargo run --features exercise`
+当前实现的边界也需要明确：
 
-## 共享调度器与 SMP 保护
+- 这版内核 trap 入口只支持 `SupervisorTimer`，其他 kernel interrupt / exception 仍会 panic
+- 多核版先采用保守的 `KERNEL_BIG_LOCK`，优先保证正确性，而不是追求极致并行
+- Doom 已经能跑在多核内核上，但 Doom 本身仍是单线程程序，并不会并行渲染
 
-### 当前实现
-1. 当前已经从“次核只跑 idle + 本地 timer”的版本，推进到“两个 hart 共用同一个 ready queue”的第一版共享调度器。
-2. 这版共享调度器的核心改动有 3 个：
-   - `PROCESSOR.current` 改成 per-hart，每个 hart 维护自己的 current 线程
-   - `MultislotPortal` 从 `1` 个 slot 扩展到按 `MAX_HARTS` 分 slot，并以 `hart_id` 作为 slot key，避免两个 hart 同时切用户态时覆盖同一块 portal cache
-   - 在线程管理器里新增 `Runnable / Running(hart_id) / Blocked` 状态，避免共享 ready queue 中的同一个 TID 被重复选中
-3. 另外，这一版用了一个**保守但有效**的 SMP 保护方案：`KERNEL_BIG_LOCK`。
-4. 当前**还没有**实现“每个 hart 一条独立 ready queue”的分核调度队列；现在仍然是：
-   - 一个全局共享 ready queue
-   - 每个 hart 一份 `current`
-   - 共享内核路径由 `KERNEL_BIG_LOCK` 串行化
+## 2. 基线与测量口径
 
-### 什么是 SMP 保护
-1. `SMP` 指的是多个 hart/CPU 会**同时**执行内核或用户线程。
-2. 所谓 `SMP 保护`，本质上就是保证这些共享状态不会被多个 hart 同时改坏，例如：
-   - ready queue
-   - `PROCESSOR.current`
-   - 进程地址空间 / 文件描述符表 / 信号状态
-   - 锁、信号量、条件变量等待队列
-3. 这次采用的是“大内核锁（Big Kernel Lock）”做法：
-   - 进入共享调度器、syscall、阻塞/唤醒、进程线程管理这些**共享内核路径**之前，先拿 `KERNEL_BIG_LOCK`
-   - 真正切到用户态执行之前释放这把锁
-   - 从用户态 trap 回内核后，先重新拿锁，再处理 syscall / timer / 调度决策
-4. 这样做的效果是：
-   - 多个 hart 仍然可以**并行执行用户线程**
-   - 但共享内核状态一次只允许一个 hart 修改，先保证正确性
-5. 这里的“大内核锁”并不是“把共享变量变成各核互不共享”，而是“这些变量仍然共享，只是内核态访问时先串行化”。
-6. 因此它能提供的是一种**保守的一致性保证**：
-   - 如果所有共享内核状态都只在持锁路径里访问，那么这版实现就更容易维持正确语义
-   - 但它不是自动正确，后续仍然要继续审计是否存在绕过大锁的共享状态访问
-7. 它的边界也很明确：
-   - 这是共享调度器的第一版，不是最终的细粒度并行内核
-   - 后续如果想进一步提升内核并行度，还要把大锁逐步拆成更细的锁，或者改成更细粒度的 per-subsystem 保护
+原先 `t4-plan.md` 和 `t4-phase0-baseline.md` 中关于基线的核心内容已经并入本报告。
 
-### 共享调度器验证
-1. 当前的 [`kernel_smp_check`](/Users/hanjiaxin/Desktop/操作系统/tg-rcore-tutorial/tg-rcore-tutorial-ch8/tg-rcore-tutorial-user/src/bin/kernel_smp_check.rs) 已经扩展为两段验证：
-   - 第一段仍然验证两个 hart 的本地 timer / kernel timer interrupt 是否都在前进
-   - 第二段会创建多个用户线程，反复调用 `KERNEL_HART_SNAPSHOT`，统计用户线程实际跑过哪些 hart
-2. 单独运行命令：
-   - `TG_CH8_INIT_APP=kernel_smp_check cargo run --features exercise`
-3. 通过现象包括：
-   - `online_mask=0x3`
-   - `hart0 delta: ticks=...`
-   - `hart1 delta: ticks=... kernel_timer_interrupts=...`
-   - `user observed hart mask=0x3`
-   - `kernel smp check passed!`
-4. 其中各条日志的含义并不相同：
-   - `online_mask=0x3` 只说明 `hart0` 和 `hart1` 都已经上线
-   - `hartX delta: ticks=...` 说明对应 hart 的本地 timer 仍在前进
-   - `user observed hart mask=0x3` 才能说明用户线程实际已经在 `hart0` 和 `hart1` 上都运行过，不再只是“次核本地 timer 在走”
-5. 如果打开调度日志，看到类似 `schedule: hart1 tid=ThreadId(...)` 也能作为旁证，说明 `hart1` 已经实际挑中了某个线程并执行。
-6. 进一步的综合回归验证方式：
-   - `TG_CH8_INIT_APP=ch8_usertest cargo run --features exercise`
-   - `tg-rcore-tutorial-checker --ch 8 --exercise < /tmp/ch8_usertest_shared_sched_v2.log`
-7. 这轮实测结果是：
-   - `kernel_smp_check` 通过，日志中有 `user observed hart mask=0x3`
-   - `kernel_interrupt_check` 仍能看到 `kernel_interrupt_check: hart0 success observed=2`
-   - `ch8_usertest` 在共享调度器下完整通过，checker 结果为 `PASS 25/25`
+后续所有 T4 对比默认采用下面的统一口径：
 
-## Doom 游戏：多核与交互模式
+- 内核：`tg-rcore-tutorial-ch8`
+- 构建模式：`debug`
+- 用户态镜像：由 `build.rs` 自动打包
+- 默认 `cargo run` 机器配置：`-smp 2`
+- 若要显式比较单核 / 双核：使用 `scripts/run-ch8-qemu.sh --smp 1|2`
 
-### 当前结论
-1. 当前 `doomgeneric` 是一个**单线程用户态程序**，因此它**不会像 `kernel_smp_check` 那样同时在两个 hart 上并行执行多个游戏线程**。
-2. 但它已经运行在支持 SMP 的 ch8 内核之上，因此：
-   - 该游戏线程可以被调度到 `hart0` 或 `hart1`
-   - 内核的另一个 hart 也仍然会继续处理本地 timer、中断与其他线程
-3. 因而这里要区分两件事：
-   - “游戏运行在多核内核上”：是
-   - “游戏自身已经改造成并行多线程、同时利用多个 hart 渲染或更新逻辑”：否
+建议固定的测量对象包括：
 
-### 游戏逻辑
-1. 当前平台层入口位于 [`tg-rcore-tutorial-ch8/doomgeneric/doomgeneric/doomgeneric_rcore.c`](/Users/hanjiaxin/Desktop/操作系统/tg-rcore-tutorial/tg-rcore-tutorial-ch8/doomgeneric/doomgeneric/doomgeneric_rcore.c)。
-2. 它的主逻辑与标准 `doomgeneric` 端口一致：
-   - 先调用 `doomgeneric_Create(...)` 完成 Doom 初始化
-   - 再在无限循环中持续调用 `doomgeneric_Tick()`
-3. 当前平台层里传给 Doom 的启动参数分成两套：
-   - `interactive`：`-iwad doom1.wad -nomusic -nosound`
-   - `demo`：`-iwad doom1.wad -playdemo demo1`
-4. 因此当前 `interactive` 模式已经不再强制 `warp` 进 `E1M1`，而是回到更接近老师演示的 title / attract / menu 流程。
-5. 如果用户启动后**长时间不按键**，后续仍可能看到类似自动演示的画面，这属于 Doom 本身的 title / credits / attract mode 轮播，而不是本移植额外强制传入了 `-playdemo`。
+- `kernel_interrupt_check`：验证内核态 timer interrupt
+- `kernel_smp_check`：验证多核 bring-up、per-hart timer、用户线程跨 hart 运行
+- `smp_bench`：验证复杂用户态应用在 1 worker / N workers 下的性能差异
+- `doomgeneric`：验证图形、文件系统、终端输入接入
 
-### 外设接入
-1. 当前这套 Doom 运行环境依赖的外设，都是通过 [`tg-rcore-tutorial-ch8/.cargo/config.toml`](/Users/hanjiaxin/Desktop/操作系统/tg-rcore-tutorial/tg-rcore-tutorial-ch8/.cargo/config.toml) 里的 QEMU runner 参数接入的。
-2. 块设备接入方式：
-   - `-drive file=target/riscv64gc-unknown-none-elf/debug/fs.img,if=none,format=raw,id=x0`
-   - `-device virtio-blk-device,drive=x0,bus=virtio-mmio-bus.0`
-   - 其中 `fs.img` 里包含内核测试程序、`doomgeneric` 用户程序以及 `doom1.wad`
-3. 图形设备接入方式：
-   - `-device virtio-gpu-device,bus=virtio-mmio-bus.1`
-   - 默认显示后端是 `-display cocoa`；若宿主机不是 macOS，可按需要改成 `sdl` 或 `gtk`
-4. 终端 / 键盘输入接入方式：
-   - `-serial mon:stdio`
-   - 因而键盘输入焦点在运行 `cargo run` 的终端，而不是 QEMU 图形窗口
-5. Doom 资源接入方式：
-   - 将 `doom1.wad` 放到 [`tg-rcore-tutorial-ch8/doomgeneric/doomgeneric`](/Users/hanjiaxin/Desktop/操作系统/tg-rcore-tutorial/tg-rcore-tutorial-ch8/doomgeneric/doomgeneric)
-   - 在该目录重新执行 `make -f Makefile.rcore`
-   - 然后回到 [`tg-rcore-tutorial-ch8`](/Users/hanjiaxin/Desktop/操作系统/tg-rcore-tutorial/tg-rcore-tutorial-ch8) 再执行 `cargo build` 或 `cargo run`，把新的用户态 ELF 和 `doom1.wad` 一起重新打进 `fs.img`
+## 3. 内核态中断的原理
 
-### 输入支持
-1. 当前默认构建模式已经改成 `interactive`：
-   - [`tg-rcore-tutorial-ch8/doomgeneric/doomgeneric/Makefile.rcore`](/Users/hanjiaxin/Desktop/操作系统/tg-rcore-tutorial/tg-rcore-tutorial-ch8/doomgeneric/doomgeneric/Makefile.rcore) 中 `DG_MODE ?= interactive`
-   - [`tg-rcore-tutorial-ch8/doomgeneric/doomgeneric/doomgeneric_rcore.c`](/Users/hanjiaxin/Desktop/操作系统/tg-rcore-tutorial/tg-rcore-tutorial-ch8/doomgeneric/doomgeneric/doomgeneric_rcore.c) 中 `DG_RCORE_INTERACTIVE` 默认也为 `1`
-2. 在该模式下：
-   - `DG_GetKey()` 会轮询 `input_getchar` syscall
-   - 终端输入会映射到 Doom 按键，例如 `WASD`、方向键、`J`、`K`、`Q`
-   - 键盘输入焦点在运行 `cargo run` 的终端，而不是 QEMU 图形窗口
-3. 当前已经接上的交互 / 外设能力是：
-   - 显示：VirtIO-GPU
-   - 存储：VirtIO block（`fs.img`）
-   - 键盘：串口终端输入，经 `input_getchar` 转成 Doom 按键
-4. 当前**没有**接上的外设主要是：
-   - 鼠标
-   - 声音 / 音乐（`interactive` 启动参数里显式传了 `-nomusic -nosound`）
-5. 当前可直接使用的常用按键为：
-   - `Q`：打开 / 关闭 Doom 菜单
-   - `WASD` 或方向键：移动 / 菜单导航
-   - `Enter`：确认
-   - `J`：开火
-   - `K` 或空格：使用 / 开门
-   - `U`：Run 修饰键
-6. 因而如果“能看到画面，但按键没有反应”，首先要检查的是**终端焦点**，而不是 QEMU 图形窗口焦点。
-7. 若要显式切换模式，可执行：
-   - `cd tg-rcore-tutorial-ch8/doomgeneric/doomgeneric`
-   - 交互版：`make -f Makefile.rcore DG_MODE=interactive`
-   - demo 版：`make -f Makefile.rcore DG_MODE=demo`
-   - 然后回到 [`tg-rcore-tutorial-ch8`](/Users/hanjiaxin/Desktop/操作系统/tg-rcore-tutorial/tg-rcore-tutorial-ch8) 执行 `cargo build` 或 `cargo run`，重新打包 `fs.img`
-8. 若想看到老师演示里那种“可选 New Game / Options / Load Game”的界面，应使用 `interactive` 模式并重新打包；此时启动后按 `Q` 就可以主动拉起菜单。
+### 3.1 核心思路
 
-### 如何验证
-1. 重新构建并运行 Doom：
-   - `cd tg-rcore-tutorial-ch8/doomgeneric/doomgeneric && make -f Makefile.rcore`
-   - `cd ../../ && cargo run`
-2. 当前实测启动日志中可以看到：
-   - `[doomgeneric] online_harts=2 current_hart=1 online_mask=0x3`
-   - `[doomgeneric] mode=interactive (keyboard from cargo run terminal)`
-3. 这些日志说明：
-   - Doom 运行时看到的确实是一个 `2 hart` 的内核环境
-   - 当前启动的是交互版，而不是强制 `-playdemo demo1` 的 demo 版
-4. 但仅靠 Doom 启动日志，还**不能**说明“游戏本身并行用到了两个 hart”，因为它仍然只有一个用户线程。
-5. 若要验证“两个 hart 都确实在并行调度用户线程”，应运行：
-   - `TG_CH8_INIT_APP=kernel_smp_check cargo run --features exercise`
-6. 其中 `user observed hart mask=0x3` 才能说明用户线程集合已经分别在 `hart0` 和 `hart1` 上运行过；这项结论适用于当前共享调度器实现，而不是 Doom 自己内部做了多线程并行。
+这版实现没有选择“中断一到就立刻在内核里切线程”，而是采用更保守的两段式设计：
 
-## 完整测试操作流程
+1. 允许 S 态内核代码被 timer interrupt 打断
+2. 中断里只做最小工作：
+   - 记录 tick
+   - 设置下一次 timer
+   - 置位当前 hart 的 `need_resched`
+3. 真正的调度切换延后到安全点处理
 
-### 0. 环境准备
-1. 准备 RISC-V 交叉编译器，例如 `riscv64-elf-gcc`；若工具链前缀不同，先设置：
-   - `export RISCV_PREFIX=riscv64-unknown-elf-`
-2. 将 `doom1.wad` 放到 [`tg-rcore-tutorial-ch8/doomgeneric/doomgeneric`](/Users/hanjiaxin/Desktop/操作系统/tg-rcore-tutorial/tg-rcore-tutorial-ch8/doomgeneric/doomgeneric)。
-3. 确认 [`tg-rcore-tutorial-ch8/.cargo/config.toml`](/Users/hanjiaxin/Desktop/操作系统/tg-rcore-tutorial/tg-rcore-tutorial-ch8/.cargo/config.toml) 已包含：
-   - `-smp 2`
-   - `virtio-blk-device`
-   - `virtio-gpu-device`
-   - `-serial mon:stdio`
+这样做的好处是：
 
-### 1. 构建 Doom 用户程序并重新打包镜像
-1. 进入 [`tg-rcore-tutorial-ch8/doomgeneric/doomgeneric`](/Users/hanjiaxin/Desktop/操作系统/tg-rcore-tutorial/tg-rcore-tutorial-ch8/doomgeneric/doomgeneric)：
-   - 交互版：`make -f Makefile.rcore DG_MODE=interactive`
-   - demo 版：`make -f Makefile.rcore DG_MODE=demo`
-2. 回到 [`tg-rcore-tutorial-ch8`](/Users/hanjiaxin/Desktop/操作系统/tg-rcore-tutorial/tg-rcore-tutorial-ch8)：
-   - `cargo build --features exercise`
-3. 如果这一步省略了 `make -f Makefile.rcore`，则 Doom C 侧修复和模式切换都不会进入新的 `fs.img`。
+- 先把“内核态也能响应中断”做正确
+- 避免在嵌套 trap 里直接修改复杂共享状态
+- 与当前教学内核的结构更匹配
 
-### 2. 单独验证内核态响应中断
-1. 在 [`tg-rcore-tutorial-ch8`](/Users/hanjiaxin/Desktop/操作系统/tg-rcore-tutorial/tg-rcore-tutorial-ch8) 执行：
-   - `TG_CH8_INIT_APP=kernel_interrupt_check cargo run --features exercise`
-2. 通过现象：
-   - 出现 `kernel_interrupt_check: hart0 success observed=2`
-3. 这说明内核能够在一次长 syscall 中响应至少 2 次 timer interrupt。
+### 3.2 实现路径
 
-### 3. 单独验证多核启动、本地 timer 与共享调度器
-1. 在 [`tg-rcore-tutorial-ch8`](/Users/hanjiaxin/Desktop/操作系统/tg-rcore-tutorial/tg-rcore-tutorial-ch8) 执行：
-   - `TG_CH8_INIT_APP=kernel_smp_check cargo run --features exercise`
-2. 当前通过现象应包含：
-   - `hart0 online (boot), online_harts=1`
-   - `hart1 online (secondary), online_harts=2`
-   - `online_mask=0x3`
-   - `hart0 delta: ticks=...`
-   - `hart1 delta: ticks=... kernel_timer_interrupts=...`
-   - `user observed hart mask=0x3`
-   - `kernel smp check passed!`
-3. 其中：
-   - `online_mask=0x3` 说明两个 hart 都已上线
-   - `user observed hart mask=0x3` 才真正说明多个用户线程已经分别在 `hart0` 和 `hart1` 上运行过
-4. 这也是当前最推荐的**用户态多核验证程序**，源码位于 [`tg-rcore-tutorial-ch8/tg-rcore-tutorial-user/src/bin/kernel_smp_check.rs`](/Users/hanjiaxin/Desktop/操作系统/tg-rcore-tutorial/tg-rcore-tutorial-ch8/tg-rcore-tutorial-user/src/bin/kernel_smp_check.rs)。
+关键实现位于 `tg-rcore-tutorial-ch8/src/main.rs`：
 
-### 3.1 用户态多核性能对照（`smp_bench`）
-1. 为了直接比较“同一份工作负载在单核和双核下的耗时差异”，新增了用户态基准程序 [`tg-rcore-tutorial-ch8/tg-rcore-tutorial-user/src/bin/smp_bench.rs`](/Users/hanjiaxin/Desktop/操作系统/tg-rcore-tutorial/tg-rcore-tutorial-ch8/tg-rcore-tutorial-user/src/bin/smp_bench.rs)。
-2. 其做法是：
-   - 先在主线程串行完成 `2` 份 CPU-bound work，得到 `sequential` 时间
-   - 再创建 `2` 个用户线程并行完成同样的工作，得到 `parallel` 时间
-   - 中途通过 `kernel_hart_snapshot` 记录用户线程实际跑过哪些 hart
-3. 构建镜像：
-   - `TG_CH8_INIT_APP=smp_bench cargo build --features exercise`
-4. 双核运行：
-   - `qemu-system-riscv64 -machine virt -serial stdio -monitor none -display none -bios none -smp 2 -m 128M -drive file=target/riscv64gc-unknown-none-elf/debug/fs.img,if=none,format=raw,id=x0 -device virtio-blk-device,drive=x0,bus=virtio-mmio-bus.0 -device virtio-gpu-device,bus=virtio-mmio-bus.1 -kernel target/riscv64gc-unknown-none-elf/debug/jiaxin2006-tg-rcore-tutorial-t1l5`
-5. 单核运行：
-   - `qemu-system-riscv64 -machine virt -serial stdio -monitor none -display none -bios none -smp 1 -m 128M -drive file=target/riscv64gc-unknown-none-elf/debug/fs.img,if=none,format=raw,id=x0 -device virtio-blk-device,drive=x0,bus=virtio-mmio-bus.0 -device virtio-gpu-device,bus=virtio-mmio-bus.1 -kernel target/riscv64gc-unknown-none-elf/debug/jiaxin2006-tg-rcore-tutorial-t1l5`
-6. 关键观察点：
-   - 双核下应看到 `online_harts=2 online_mask=0x3`
-   - 双核下应看到 `observed_harts=0x3`
-   - 单核下应看到 `online_harts=1 online_mask=0x1`
-   - 单核下应看到 `observed_harts=0x1`
-7. 当前实测结果为：
-   - `-smp 1`：`parallel elapsed=5133366 us`，`observed_harts=0x1`，`speedup=0.849x`
-   - `-smp 2`：`parallel elapsed=2843263 us`，`observed_harts=0x3`，`speedup=1.732x`
-8. 因而以同一份 `parallel` 工作负载直接比较，双核版本相对单核版本约快 `1.80x`；这说明当前“全局 ready queue + per-hart current + 大内核锁”的版本已经能让 CPU-bound 用户线程在两个 hart 上获得实质加速。
+- `KernelInterruptGuard`
+  - 在较长的内核路径里临时安装 `kernel_trap_entry`
+  - 打开 `sstatus.sie`
+  - 允许 timer interrupt 打断当前 S 态代码
+- `kernel_trap_entry`
+  - 保存寄存器现场
+  - 跳到 `kernel_trap_handler`
+- `kernel_trap_handler`
+  - 当前只处理 `SupervisorTimer`
+  - 调用 `record_timer_tick()`
+  - `record_timer_tick()` 会更新本 hart 的 `timer_ticks`
+  - 同时置位 `need_resched`
+  - 并通过 `program_next_timer()` 重新编程下一次 timer
 
-### 4. 跑完整回归
-1. 执行：
-   - `TG_CH8_INIT_APP=ch8_usertest cargo run --features exercise`
-2. 若要进一步交给 checker：
-   - `TG_CH8_INIT_APP=ch8_usertest cargo run --features exercise > /tmp/ch8_usertest.log 2>&1`
-   - `tg-rcore-tutorial-checker --ch 8 --exercise < /tmp/ch8_usertest.log`
-3. 通过现象：
-   - 日志出现 `ch8 Usertests passed!`
-   - checker 返回 `PASS 25/25`
+M 态到 S 态的 timer 转发也已经补齐：
 
-### 5. 运行 Doom 并验证图形 / 输入链路
-1. 执行：
-   - `cargo run`
-2. 图形链路正常时，可在日志中看到：
-   - `virtio-gpu: resolution=...`
-   - `virtio-gpu: framebuffer initialized`
-3. 交互模式下，还会看到：
-   - `[doomgeneric] mode=interactive (keyboard from cargo run terminal)`
-4. 若切到 demo 模式，则启动参数中会带 `-playdemo demo1`；若切到 interactive 模式，则不再强制自动播放 demo。
-5. 需要特别说明的是：Doom 是单线程用户程序，因此**不能单靠 Doom 本身证明“多个用户线程已经在两个 hart 上并行运行”**；这一点仍应以 `kernel_smp_check` 的 `user observed hart mask=0x3` 为准。
+- `tg-rcore-tutorial-sbi` 负责设置 `mtimecmp`
+- M 态 timer 到达后显式置位 `STIP`
+- S 态最终收到 `SupervisorTimer`
 
-### Doom 启动黑屏修复
-1. 这轮遇到的“启动后黑屏”并不是 VirtIO-GPU 本身失效，而是 Doom 用户态程序在真正进入图形初始化前就卡住了。
-2. 根因主要在 Doom 的 rCore 适配层和简化单机路径：
-   - [`tg-rcore-tutorial-ch8/doomgeneric/doomgeneric/d_loop.c`](/Users/hanjiaxin/Desktop/操作系统/tg-rcore-tutorial/tg-rcore-tutorial-ch8/doomgeneric/doomgeneric/d_loop.c) 里 `D_StartNetGame` 的 `#else` 分支此前漏掉了 `localplayer`、`local_playeringame[]`、`maketic/recvtic/gametic/skiptics` 这些单机循环状态初始化
-   - [`tg-rcore-tutorial-ch8/doomgeneric/doomgeneric/d_main.c`](/Users/hanjiaxin/Desktop/操作系统/tg-rcore-tutorial/tg-rcore-tutorial-ch8/doomgeneric/doomgeneric/d_main.c) 里启动时还会在 `I_InitGraphics()` 之前先跑一次 `TryRunTics()`，更容易把问题暴露成“卡在首帧前”
-   - [`tg-rcore-tutorial-ch8/tg-rcore-tutorial-user/src/bin/initproc.rs`](/Users/hanjiaxin/Desktop/操作系统/tg-rcore-tutorial/tg-rcore-tutorial-ch8/tg-rcore-tutorial-user/src/bin/initproc.rs) 现在也改成了默认直接 `exec("doomgeneric")`，避免 Doom 场景下额外的父进程持续 `wait/yield`
-3. 修复后，Doom 的 C 侧程序需要**先单独重编**再重新打包镜像：
-   - `cd tg-rcore-tutorial-ch8/doomgeneric/doomgeneric`
-   - `make -f Makefile.rcore`
-   - `cd ../../`
-   - `cargo build` 或 `cargo run`
-4. 这一步很关键，因为 `doomgeneric` 是单独的 C 用户程序；只改 Rust 内核代码而不重新 `make`，新的 Doom 侧修复不会进入 `fs.img`。
-5. 当前我用无界面 QEMU 连续冷启动 5 次验证，日志都能稳定走到 `I_InitGraphics: ...`，不再卡死在图形初始化之前的黑屏阶段。
+### 3.3 为什么当前只处理中断，不直接在 trap 里切换
 
-### Bug
-1. 在 `kernel_trap_handler` 中，为了极小化测试内核中断, 当前只支持 `SupervisorTimer`(参考前面的实现), 但是导致在运行 doom 的时候出现在内核态触发 LoadPageFault 的情况. 
-    - 用户态只成功打印了 before init_console，然后就在 init_console 里面炸成了 StorePageFault stval=0x0。这说明根因不在堆分配器，也不在 Doom，本质上是“用户态第一次注册 console/logger 时往空地址写了”。
-    - 更准确地说，是当前 `5 ms` timer 仍然足够频繁，比较容易稳定复现这个问题；真正根因不是“时间片太小”，而是用户态在 `init_console` 过程中被 timer 打断后，M 态 trap 返回路径没有恢复原本的 `a0/a1`，导致返回用户态的寄存器/上下文被破坏，后续 `log::set_logger` 里的原子存储才会写到空地址。
-    - 进一步定位后发现，真正需要修的是 [`tg-rcore-tutorial-sbi/src/m_entry.asm`](/Users/hanjiaxin/Desktop/操作系统/tg-rcore-tutorial/tg-rcore-tutorial-sbi/src/m_entry.asm) 里的 `m_trap_vector` 返回路径，而不是 Rust 里的 `m_trap_handler` 本体：
-      - `m_trap_handler` 负责根据 `mcause` 分发 `ecall` / `machine timer interrupt`，并返回 `SbiRet`
-      - 但 `m_trap_vector` 在 `call m_trap_handler` 之后，原先默认把 `a0/a1` 当成返回值保留下来
-      - 这只对 **S-mode ecall** 是正确的，因为此时 `a0/a1` 语义就是 SBI 返回值
-      - 对 **异步 timer interrupt** 则不对，因为被打断现场里的 `a0/a1` 仍然是当前 S/U 态代码的参数寄存器，返回前必须恢复
-      - 因此修复方式是：在 `m_trap_vector` 里先把 `a0/a1` 保存到栈上；`mcause == 9`（S-mode ecall）时保留 `m_trap_handler` 写回的 `a0/a1`，其余中断路径在 `mret` 前恢复原来的 `a0/a1`
-2. 调度主循环里原先是直接对 `find_next()` 返回的 `&mut task` 调 `task.context.execute(...)`。这会让主循环层面把线程对象借用跨在整段 `execute -> trap -> 返回调度器` 往返上，可读性很差，也容易让人误判成“外层还持有线程可变借用时又去访问 `PROCESSOR`”。现在已改成：
-   - 先用 `find_next_id()` 只选中当前线程 ID
-   - 再通过短作用域的 `with_current_task(...)` 闭包读取日志快照和执行 `context.execute(...)`
-   - 这样主循环不再直接暴露调度器里线程实体的长生命周期 `&mut` 借用，调度路径更清晰
+因为当前内核的共享状态仍较多：
+
+- 调度器
+- 线程状态
+- 进程对象
+- 文件描述符表
+- 同步原语等待队列
+
+如果在 kernel trap 内直接抢占并切线程，复杂度会显著上升。当前的 `need_resched` 方案本质上是“延期调度请求”，中断只负责发出请求，真正切换放在统一调度点完成。
+
+## 4. 多核的实现方式
+
+### 4.1 boot hart / secondary hart
+
+当前多核启动采用“boot hart 一次性初始化 + secondary hart 本地 bring-up”的结构：
+
+- `hart0`
+  - 清 BSS
+  - 初始化堆、页表、portal、syscall、设备
+  - 加载第一个用户程序
+  - 放行次核
+- `hart1`
+  - 不重复做全局初始化
+  - 只激活内核地址空间
+  - 安装本核 trap
+  - 设置本核 timer
+  - 进入同一套 `scheduler_loop`
+
+内核里用这些量跟踪多核状态：
+
+- `ONLINE_HARTS`
+- `ONLINE_HART_MASK`
+- `current_hart_id()`
+
+### 4.2 per-hart 本地状态
+
+当前已经拆成 per-hart 的状态包括：
+
+- `need_resched`
+- `timer_ticks`
+- `kernel_timer_interrupts`
+- 当前运行线程 `current`
+- portal slot
+
+实现上主要对应：
+
+- `HART_LOCAL`
+- `PThreadManager.current: [Option<ThreadId>; MAX_HARTS]`
+- `MultislotPortal::init_transit(..., MAX_HARTS)`
+
+这样每个 hart 都有自己的一份“当前 CPU 局部状态”，不再沿用单核时代“全局只有一个 current”的假设。
+
+### 4.3 当前多核调度策略
+
+当前调度器采用：
+
+- 每个 hart 一条本地 ready queue
+- 本地队列优先
+- 本地为空时从其他 hart 的队列尾部偷任务
+
+具体策略是：
+
+1. `fetch_for(hart_id)` 先从本地队列 `pop_front()`
+2. 本地没有任务时，选择 ready queue 最长的其他 hart 作为 victim
+3. 从 victim 队列 `pop_back()` 实现 work stealing
+
+线程运行状态采用三态：
+
+- `Runnable`
+- `Running(hart_id)`
+- `Blocked`
+
+这样可以避免同一个线程同时被两个 hart 选中。
+
+### 4.4 当前多核“开关”在哪里
+
+当前没有内核内部的“单核 / 多核运行时开关”，控制点在 QEMU 层：
+
+- `cargo run` 默认使用 `tg-rcore-tutorial-ch8/.cargo/config.toml` 里的 `-smp 2`
+- 如果要显式切到单核 / 双核，可以使用新增脚本：
+
+```bash
+bash scripts/run-ch8-qemu.sh --smp 1
+bash scripts/run-ch8-qemu.sh --smp 2
+```
+
+推荐的使用方式是：
+
+```bash
+cd tg-rcore-tutorial-ch8
+TG_CH8_INIT_APP=smp_bench cargo build --features exercise
+bash ../scripts/run-ch8-qemu.sh --smp 1
+bash ../scripts/run-ch8-qemu.sh --smp 2
+```
+
+也就是说，“多核开关”目前本质上是 QEMU 的 `-smp N`。
+
+## 5. 锁与并发策略
+
+### 5.1 第一层：大内核锁
+
+当前 T4 采用的是保守的第一版 SMP 保护策略：
+
+- `KERNEL_BIG_LOCK`
+
+它的使用原则是：
+
+- 进入共享内核路径前先拿锁
+- 切到用户态执行前释放锁
+- 用户态 trap 回内核后重新拿锁
+
+因此当前的并行性是：
+
+- 多个 hart 可以并行执行用户线程
+- 共享内核状态仍然一次只允许一个 hart 修改
+
+这是一个典型的“先保证正确，再逐步细化锁粒度”的教学实现。
+
+### 5.2 第二层：对象内部状态保护
+
+同步原语本身仍然维护自己的内部状态，例如：
+
+- `MutexBlocking`
+- `Semaphore`
+- `Condvar`
+- `RwLock`
+
+这些对象内部会维护：
+
+- `holder`
+- `wait_queue`
+- 资源计数
+
+当前 `exp5-sync` 的 kernel 实现大量使用 `UPIntrFreeCell`。这一点非常重要：
+
+- `UPIntrFreeCell` 的语义是“关本核中断 + 保护当前 CPU 上的临界区”
+- 它本身不是一个完整的跨 hart SMP 锁
+
+所以当前 T4 的正确性依赖关系是：
+
+1. 跨 hart 的共享内核路径先由 `KERNEL_BIG_LOCK` 串行化
+2. 对象内部再用 `UPIntrFreeCell` 维护本对象状态的一致性
+
+这也是为什么现在说“多核策略是保守的”：
+
+- 先用一把大锁覆盖共享内核路径
+- 而不是立刻把所有子系统都改造成细粒度 SMP 锁
+
+### 5.3 什么时候阻塞，什么时候自旋
+
+这版的判断标准是“同步原语语义”决定调度动作：
+
+- `MutexBlocking` / `Semaphore` / `Condvar` / `RwLock`
+  - 获取失败后返回 `-1`
+  - 调度器把当前线程标记为 `Blocked`
+- `SpinLock`
+  - 获取失败后不进入阻塞队列语义
+  - 返回忙失败
+  - 调度器不会把它当作真正的睡眠阻塞
+
+因此当前“锁和并发策略”的判断逻辑可以概括为：
+
+- CPU 局部状态：直接 per-hart 化
+- 共享内核路径：先走 `KERNEL_BIG_LOCK`
+- 同步对象内部：对象自己维护等待队列与持有者
+- 是否阻塞：由 syscall 返回码和同步原语语义决定
+
+## 6. 测试方式
+
+### 6.1 内核态中断测试：`kernel_interrupt_check`
+
+用途：
+
+- 验证一次长 syscall 中，内核是否真的收到了 timer interrupt
+
+方法：
+
+1. 用户态调用 `kernel_interrupt_check(min_interrupts)`
+2. 内核进入较长路径
+3. 通过 `KernelInterruptGuard` 打开 S 态中断
+4. 内核忙等一段时间
+5. 统计 `kernel_timer_interrupts` 是否增长到目标值
+
+通过条件：
+
+- 在一次长 syscall 中观测到至少 2 次内核态 timer interrupt
+
+命令：
+
+```bash
+cd tg-rcore-tutorial-ch8
+TG_CH8_INIT_APP=kernel_interrupt_check cargo run --features exercise
+```
+
+### 6.2 多核正确性测试：`kernel_smp_check`
+
+用途：
+
+- 验证两个 hart 都已上线
+- 验证两个 hart 的本地 timer 都在前进
+- 验证用户线程集合确实跑到了多个 hart 上
+
+方法分两段：
+
+1. 先做两次 `kernel_hart_snapshot`
+   - 检查 `online_mask`
+   - 检查 `timer_ticks` 增量
+2. 再创建多个用户线程
+   - 每个线程反复调用 `kernel_hart_snapshot`
+   - 汇总 `user observed hart mask`
+
+通过条件：
+
+- `online_mask` 包含 `hart0` 和 `hart1`
+- 两个 hart 的 `timer_ticks` 都增长
+- `user observed hart mask=0x3`
+
+命令：
+
+```bash
+cd tg-rcore-tutorial-ch8
+TG_CH8_INIT_APP=kernel_smp_check cargo run --features exercise
+```
+
+### 6.3 性能展示程序：`smp_bench`
+
+#### 逻辑
+
+`smp_bench` 现在是一个确定性的分块渲染 benchmark：
+
+1. 把 640x400 的 framebuffer 切成 320 个 tile
+2. 每个 tile 做固定点 Mandelbrot 风格计算
+3. 比较两种模式：
+   - `1 worker`
+   - `online_harts workers`
+4. 主线程自己也参与计算，作为 `worker 0`
+5. 额外线程作为 `worker 1..N-1`
+6. 所有 worker 都做同一份总工作量，只是按 `tile_id % worker_count` 分工
+7. 记录：
+   - 每轮耗时
+   - 校验和
+   - `observed_harts`
+
+这版 benchmark 有两个关键点：
+
+- 对比的是同一 guest 内的 `1 worker` 和 `N workers`，不是只看“开了 2 hart 就一定变快”
+- 会验证 checksum 一致，避免“少算了工作”带来虚假的提速
+
+#### 当前实测结果
+
+当前仓库里我实际跑到的结果如下：
+
+- `--smp 2`
+  - `1 worker avg = 1,579,220 us`
+  - `2 workers avg = 857,663 us`
+  - `speedup = 1.84x`
+- `--smp 1`
+  - `1 worker avg = 1,112,014 us`
+  - `1 worker avg = 1,112,335 us`
+  - `speedup = 0.99x`
+
+这说明：
+
+- 在双核 guest 里，`smp_bench` 已经能展示明显的并行收益
+- 在单核 guest 里，它不会凭空制造“多核加速”
+
+需要注意一个细节：
+
+- “单核 guest 的 1 worker” 和 “双核 guest 的 1 worker” 不一定完全等价
+- 双核 guest 会多一个次核和本地 timer，因此额外开销略有不同
+
+因此最核心的性能结论应看：
+
+- 同一双核 guest 里 `1 worker -> 2 workers` 的速度提升
+
+#### 运行命令
+
+```bash
+cd tg-rcore-tutorial-ch8
+TG_CH8_INIT_APP=smp_bench cargo build --features exercise
+bash ../scripts/run-ch8-qemu.sh --smp 1
+bash ../scripts/run-ch8-qemu.sh --smp 2
+```
+
+## 7. Doom 当前的接入方式
+
+### 7.1 Doom 是否支持多核
+
+当前答案是：
+
+- Doom 运行在支持 SMP 的内核上：是
+- Doom 本身已经改造成多线程并行应用：否
+
+原因很简单：
+
+- 当前 `doomgeneric` 仍然只有一个用户线程
+- 它可以被调度到不同 hart
+- 但不会同时在两个 hart 上并行渲染或并行更新游戏逻辑
+
+所以 Doom 现在更适合作为：
+
+- 图形路径
+- 文件系统路径
+- 键盘输入路径
+
+的综合验证，而不是“多核性能展示应用”。
+
+### 7.2 Doom 的资源和设备接入
+
+当前 Doom 接入依赖四条路径：
+
+1. 文件系统
+   - `doomgeneric` ELF 和 `doom1.wad` 都被打进 `fs.img`
+2. 块设备
+   - QEMU `virtio-blk-device`
+3. 图形
+   - QEMU `virtio-gpu-device`
+4. 键盘输入
+   - QEMU `-serial mon:stdio`
+
+因此 Doom 的键盘焦点不在图形窗口，而在启动 `cargo run` 或 QEMU 的那个终端。
+
+### 7.3 键盘是怎么接入的
+
+当前键盘路径是：
+
+1. QEMU 把终端输入送到串口
+2. 内核 `input_getchar()` 直接读 UART MMIO：
+   - `UART_LSR`
+   - `UART_RBR`
+3. Doom 平台层 `poll_input()` 轮询 `SYS_input_getchar`
+4. `DG_GetKey()` 从本地队列取键
+5. `i_input.c` 里的 `I_GetEvent()` 把它转成：
+   - `ev_keydown`
+   - `ev_keyup`
+6. Doom 最终通过 `D_PostEvent()` 接收按键事件
+
+当前已经接上的常用按键包括：
+
+- `WASD` / 方向键
+- `Q`
+- `Enter`
+- `J`
+- `K`
+- `U`
+
+### 7.4 还没有接入的输入
+
+当前还没有真正接入的是：
+
+- 鼠标
+- 声音 / 音乐
+
+其中声音在启动参数里已经显式关闭：
+
+- interactive：`-nomusic -nosound`
+
+鼠标方面，Doom 本身是支持 `ev_mouse` 事件的，但当前平台层还没有提供鼠标输入源。
+
+### 7.5 当前交互 / demo 模式
+
+当前 `Makefile.rcore` 默认是：
+
+- `DG_MODE ?= interactive`
+
+其中：
+
+- `interactive`
+  - `-iwad doom1.wad -nomusic -nosound`
+- `demo`
+  - `-iwad doom1.wad -playdemo demo1`
+
+切换命令：
+
+```bash
+cd tg-rcore-tutorial-ch8/doomgeneric/doomgeneric
+make -f Makefile.rcore DG_MODE=interactive
+make -f Makefile.rcore DG_MODE=demo
+```
+
+然后回到 `tg-rcore-tutorial-ch8` 重新 `cargo build` / `cargo run`，把新的 Doom ELF 重新打进 `fs.img`。
+
+## 8. 结论
+
+当前 T4 可以总结为：
+
+1. 内核态响应中断已经完成，原理是“允许 S 态被 timer 打断，但调度延后到安全点”
+2. 多核已经完成，核心做法是“boot/secondary 分流 + per-hart 本地状态 + 本地队列 + work stealing”
+3. 正确性测试已经补齐：
+   - `kernel_interrupt_check`
+   - `kernel_smp_check`
+4. 复杂性能展示程序已经补齐：
+   - `smp_bench`
+   - 并且当前实测能显示双核 guest 中 `1.84x` 的提速
+5. Doom 已成功接入图形、文件系统和终端键盘输入，但仍是单线程程序
+
+这版实现的技术取向是：
+
+- 先用 `KERNEL_BIG_LOCK` 保守落地 SMP 正确性
+- 先证明“内核态中断”和“多核线程调度”都能工作
+- 再在此基础上展示复杂用户态程序的性能收益

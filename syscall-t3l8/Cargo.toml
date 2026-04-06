@@ -1,12 +1,12 @@
 [package]
-name = "jiaxin2006-tg-rcore-tutorial-syscall-t3l8"
-description = "Fork of rCore tutorial syscall definitions: framebuffer syscalls, UART input_getchar, lseek on IO trait (chapter 8 / Doom). Does not replace upstream tg-rcore-tutorial-syscall on crates.io."
-version = "0.0.1-preview.1"
+name = "jiaxin2006-tg-rcore-tutorial-syscall-t4"
+description = "Custom T4 syscall fork for rCore tutorial: framebuffer, UART input, kernel interrupt test, and SMP snapshot interfaces."
+version = "0.0.4-preview.1"
 edition = "2024"
 authors = ["Jiaxin Han <hanjx23@mails.tsinghua.edu.cn>"]
 repository = "https://github.com/Jiaxin2006/tg-rcore-tutorial"
 homepage = "https://github.com/Jiaxin2006/tg-rcore-tutorial"
-documentation = "https://docs.rs/jiaxin2006-tg-rcore-tutorial-syscall-t3l8"
+documentation = "https://docs.rs/jiaxin2006-tg-rcore-tutorial-syscall-t4"
 license = "GPL-3.0"
 readme = "README.md"
 keywords = ["rcore", "syscall", "no-std", "riscv", "framebuffer"]

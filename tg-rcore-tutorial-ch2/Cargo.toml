@@ -18,7 +18,7 @@ panic = "abort"
 panic = "abort"
 
 [dependencies]
-tg-sbi = { package = "tg-rcore-tutorial-sbi", path = "../tg-rcore-tutorial-sbi", version = "0.4.8", features = ["nobios"] }
+tg-sbi = { package = "jiaxin2006-tg-rcore-tutorial-sbi-t4", path = "../tg-rcore-tutorial-sbi", version = "0.0.4-preview.1", features = ["nobios"] }
 virtio-drivers = "0.1.0"
 tg-kernel-alloc = { package = "tg-rcore-tutorial-kernel-alloc", path = "../tg-rcore-tutorial-kernel-alloc", version = "0.4.8" }
 riscv = "0.10.1"

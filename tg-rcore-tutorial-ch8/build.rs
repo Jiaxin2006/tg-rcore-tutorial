@@ -196,6 +196,7 @@ fn easy_fs_pack(
     // 可选：若已用 `make -f Makefile.rcore` 生成 C 版 doomgeneric，一并打入镜像。
     let ch8_root = PathBuf::from(env::var_os("CARGO_MANIFEST_DIR").unwrap());
     let doom_dir = ch8_root.join("doomgeneric/doomgeneric");
+    println!("cargo:rerun-if-changed={}", doom_dir.display());
     let doom_elf = doom_dir.join("doomgeneric");
     if doom_elf.is_file() {
         println!("cargo:rerun-if-changed={}", doom_elf.display());
@@ -229,14 +230,24 @@ fn ensure_tg_user() -> PathBuf {
     }
 
     // 从 .cargo/config.toml [env] 读取三个配置项
-    let crate_name = env::var("TG_USER_CRATE")
-        .expect("TG_USER_CRATE not set; add it to .cargo/config.toml [env]");
     let local_dir_name = env::var("TG_USER_LOCAL_DIR")
         .expect("TG_USER_LOCAL_DIR not set; add it to .cargo/config.toml [env]");
+    let crate_name = env::var("TG_USER_CRATE")
+        .expect("TG_USER_CRATE not set; add it to .cargo/config.toml [env]");
     let version = env::var("TG_USER_VERSION")
         .expect("TG_USER_VERSION not set; add it to .cargo/config.toml [env]");
 
     let manifest_dir = PathBuf::from(env::var_os("CARGO_MANIFEST_DIR").unwrap());
+
+    // 在课程仓库中开发时，优先使用仓库根目录下的最新 tg-user 源码，
+    // 避免 ch8/ 下的历史缓存副本遮蔽当前修改。
+    if let Some(workspace_root) = manifest_dir.parent() {
+        let sibling_dir = workspace_root.join(&local_dir_name);
+        if sibling_dir.join("Cargo.toml").exists() {
+            return sibling_dir;
+        }
+    }
+
     let tg_user_dir = manifest_dir.join(&local_dir_name);
 
     // 本地缓存目录已存在则直接使用

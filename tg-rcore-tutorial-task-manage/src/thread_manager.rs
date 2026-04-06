@@ -5,7 +5,7 @@ use crate::ThreadId;
 
 use super::id::ProcId;
 use super::manager::Manage;
-use super::scheduler::Schedule;
+use super::scheduler::HartSchedule;
 use super::ProcThreadRel;
 use core::marker::PhantomData;
 
@@ -21,7 +21,7 @@ enum ThreadRunState {
 #[cfg(feature = "thread")]
 /// PThreadManager 数据结构，只管理进程以及进程之间的父子关系
 /// P 表示进程, T 表示线程
-pub struct PThreadManager<P, T, MT: Manage<T, ThreadId> + Schedule<ThreadId>, MP: Manage<P, ProcId>>
+pub struct PThreadManager<P, T, MT: Manage<T, ThreadId> + HartSchedule<ThreadId>, MP: Manage<P, ProcId>>
 {
     // 进程之间父子关系
     rel_map: BTreeMap<ProcId, ProcThreadRel>,
@@ -39,7 +39,7 @@ pub struct PThreadManager<P, T, MT: Manage<T, ThreadId> + Schedule<ThreadId>, MP
     phantom_p: PhantomData<P>,
 }
 
-impl<P, T, MT: Manage<T, ThreadId> + Schedule<ThreadId>, MP: Manage<P, ProcId>>
+impl<P, T, MT: Manage<T, ThreadId> + HartSchedule<ThreadId>, MP: Manage<P, ProcId>>
     PThreadManager<P, T, MT, MP>
 {
     /// 新建 PThreadManager
@@ -74,7 +74,7 @@ impl<P, T, MT: Manage<T, ThreadId> + Schedule<ThreadId>, MP: Manage<P, ProcId>>
     }
     /// 选择下一个线程，只记录 current，不把线程实体借用暴露到外层。
     pub fn find_next_id_for(&mut self, hart_id: usize) -> Option<ThreadId> {
-        while let Some(id) = self.manager.as_mut().unwrap().fetch() {
+        while let Some(id) = self.manager.as_mut().unwrap().fetch_for(hart_id) {
             if let Some(other_hart) = self.running_hart_for(id, hart_id) {
                 // 防御性修正：若 ready queue 里残留了“实际上已在其他 hart 运行”的线程，
                 // 不再重复调度它，并把状态纠正回 Running(other_hart)。
@@ -119,7 +119,7 @@ impl<P, T, MT: Manage<T, ThreadId> + Schedule<ThreadId>, MP: Manage<P, ProcId>>
                 self.states.insert(id, ThreadRunState::Running(other_hart));
             } else {
                 self.states.insert(id, ThreadRunState::Runnable);
-                self.manager.as_mut().unwrap().add(id);
+                self.manager.as_mut().unwrap().add_for(hart_id, id);
             }
             *self.current_slot_mut(hart_id) = None;
         }
@@ -169,16 +169,24 @@ impl<P, T, MT: Manage<T, ThreadId> + Schedule<ThreadId>, MP: Manage<P, ProcId>>
     }
     /// 某个线程重新入队
     pub fn re_enque(&mut self, id: ThreadId) {
+        self.re_enque_for(0, id);
+    }
+    /// 某个线程重新入队到指定 hart 的本地队列。
+    pub fn re_enque_for(&mut self, hart_id: usize, id: ThreadId) {
         if matches!(self.states.get(&id), Some(ThreadRunState::Blocked)) {
             self.states.insert(id, ThreadRunState::Runnable);
-            self.manager.as_mut().unwrap().add(id);
+            self.manager.as_mut().unwrap().add_for(hart_id, id);
         }
     }
     /// 添加线程
     pub fn add(&mut self, id: ThreadId, task: T, pid: ProcId) {
+        self.add_for(0, id, task, pid);
+    }
+    /// 添加线程并放入指定 hart 的本地队列。
+    pub fn add_for(&mut self, hart_id: usize, id: ThreadId, task: T, pid: ProcId) {
         self.manager.as_mut().unwrap().insert(id, task);
         self.states.insert(id, ThreadRunState::Runnable);
-        self.manager.as_mut().unwrap().add(id);
+        self.manager.as_mut().unwrap().add_for(hart_id, id);
         // 增加线程与进程之间的从属关系
         if let Some(parent_rel) = self.rel_map.get_mut(&pid) {
             parent_rel.add_thread(id);

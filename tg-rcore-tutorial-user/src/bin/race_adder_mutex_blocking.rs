@@ -6,7 +6,7 @@ extern crate user_lib;
 extern crate alloc;
 
 use alloc::vec::Vec;
-use user_lib::{clock_gettime, exit, thread_create, waittid, ClockId, TimeSpec};
+use user_lib::{ClockId, TimeSpec, clock_gettime, exit, thread_create, waittid};
 use user_lib::{mutex_create, mutex_lock, mutex_unlock};
 
 static mut A: usize = 0;

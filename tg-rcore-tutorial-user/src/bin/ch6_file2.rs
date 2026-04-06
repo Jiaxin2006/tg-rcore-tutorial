@@ -4,7 +4,7 @@
 #[macro_use]
 extern crate user_lib;
 
-use user_lib::{close, fstat, link, open, read, unlink, write, OpenFlags, Stat};
+use user_lib::{OpenFlags, Stat, close, fstat, link, open, read, unlink, write};
 
 // 教学目标：
 // 覆盖硬链接创建/删除语义，并验证 inode/dev 一致与 nlink 变化。

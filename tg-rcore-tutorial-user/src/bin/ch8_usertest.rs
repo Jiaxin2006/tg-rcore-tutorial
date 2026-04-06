@@ -28,6 +28,7 @@ const TESTS: &[&str] = &[
     "test_condvar",
     "pipetest",
     "kernel_interrupt_check",
+    "kernel_smp_check",
     "ch8_deadlock_mutex1",
     "ch8_deadlock_sem1",
     "ch8_deadlock_sem2",

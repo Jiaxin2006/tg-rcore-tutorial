@@ -1,7 +1,7 @@
 [package]
 name = "jiaxin2006-tg-rcore-tutorial-t2l4"
 description = "Student AI4OSE lab crate for Experiment 4 of rCore Tutorial: pluggable scheduler comparison (FCFS, SJF, RR, MLFQ, CFS-like) with metrics collection."
-version = "0.0.2-preview.2"
+version = "0.0.4-preview.1"
 edition = "2024"
 authors = ["Jiaxin Han <hanjx23@mails.tsinghua.edu.cn>"]
 repository = "https://github.com/Jiaxin2006/tg-rcore-tutorial"
@@ -23,7 +23,7 @@ task-manage-compat = ["dep:tg-task-manage"]
 name = "exp4_scheduler"
 
 [dependencies]
-tg-task-manage = { package = "tg-rcore-tutorial-task-manage", path = "../tg-rcore-tutorial-task-manage", version = "0.4.8", optional = true }
+tg-task-manage = { package = "jiaxin2006-tg-rcore-tutorial-task-manage-t4", path = "../tg-rcore-tutorial-task-manage", version = "0.0.4-preview.1", optional = true }
 
 [[test]]
 name = "sched_compare"

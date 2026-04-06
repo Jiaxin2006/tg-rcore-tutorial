@@ -4,7 +4,7 @@
 #[macro_use]
 extern crate user_lib;
 
-use user_lib::{close, fstat, open, OpenFlags, Stat, StatMode};
+use user_lib::{OpenFlags, Stat, StatMode, close, fstat, open};
 
 // 教学目标：
 // 验证 fstat 回填结构体是否与预期一致（文件类型/链接计数）。

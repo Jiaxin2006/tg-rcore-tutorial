@@ -1,12 +1,12 @@
 [package]
-name = "tg-rcore-tutorial-sbi"
-description = "SBI (Supervisor Binary Interface) call wrappers for rCore tutorial OS."
-version = "0.4.8"
+name = "jiaxin2006-tg-rcore-tutorial-sbi-t4"
+description = "Custom T4 SBI fork for rCore tutorial OS: timer forwarding and SMP bring-up support."
+version = "0.0.4-preview.1"
 edition = "2024"
-authors = ["Ivans-11 <w-yf22@mails.tsinghua.edu.cn>"]
-repository = "https://github.com/rcore-os/tg-rcore-tutorial-sbi"
-homepage = "https://github.com/rcore-os/tg-rcore-tutorial-sbi/tree/test"
-documentation = "https://docs.rs/tg-rcore-tutorial-sbi"
+authors = ["Jiaxin Han <hanjx23@mails.tsinghua.edu.cn>"]
+repository = "https://github.com/Jiaxin2006/tg-rcore-tutorial"
+homepage = "https://github.com/Jiaxin2006/tg-rcore-tutorial/tree/test/tg-rcore-tutorial-sbi"
+documentation = "https://docs.rs/jiaxin2006-tg-rcore-tutorial-sbi-t4"
 license = "GPL-3.0"
 readme = "README.md"
 keywords = ["rcore", "sbi", "no-std", "riscv"]

@@ -4,7 +4,7 @@
 #[macro_use]
 extern crate user_lib;
 
-use user_lib::{close, open, unlink, write, OpenFlags};
+use user_lib::{OpenFlags, close, open, unlink, write};
 
 // 教学目标：
 // 反复 open/write/close/unlink，验证文件资源回收与目录项一致性。

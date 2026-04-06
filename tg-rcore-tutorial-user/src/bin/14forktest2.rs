@@ -4,7 +4,7 @@
 #[macro_use]
 extern crate user_lib;
 
-use user_lib::{clock_gettime, exit, fork, getpid, sleep, wait, ClockId, TimeSpec};
+use user_lib::{ClockId, TimeSpec, clock_gettime, exit, fork, getpid, sleep, wait};
 
 static NUM: usize = 30;
 
