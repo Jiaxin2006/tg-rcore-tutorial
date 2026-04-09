@@ -3,7 +3,7 @@
 //! 提供 [`run_all_comparisons`] 一键运行所有场景 × 所有原语组合，
 //! 输出格式化对比表。
 
-use crate::metrics::{format_comparison_table, ComparisonRow};
+use crate::metrics::{format_comparison_table, ComparisonRow, SyncMetrics};
 use crate::scenarios::*;
 use std::time::Duration;
 
